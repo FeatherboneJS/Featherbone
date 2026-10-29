@@ -1,43 +1,149 @@
 # Featherbone regression tests
 
-Pins the current behavior of the framework and the SupplyChain modules so a
-refactor can be checked against it. No new dependencies: the suite uses
+Pins the current behavior of the framework, and runs the tests modules
+carry in their own packages, so a refactor can be checked against it. No new dependencies: the suite uses
 `node:test` and `node:assert` (Node 18+; developed on Node 22).
 
 ## Running
 
 ```text
-node test/run.js                # everything: unit, then integration
+node test/run.js                # core, then every module in the SupplyChain seed
+node test/run.js core           # core only: unit, then api
 node test/run.js unit           # unit tests only, no database needed
-node test/run.js integration    # api/ and supplychain/ against a database
-node test/run.js supplychain/purchasing   # files whose path contains this
+node test/run.js integration    # api/ and deployed modules
+node test/run.js SupplyChain    # one package's tests
+node test/run.js sell           # one module a package carries
+node test/run.js SupplyChain@2.2.32   # deploy that version into the copy first
+node test/run.js --package ~/Documents/SupplyChain [sell]   # a working copy
+node test/run.js api/crud       # files whose path contains this
 ```
+
+### Module tests
+
+A module's tests live in its package, in a `test/` folder beside its
+manifest (ADR-003): SupplyChain's are in `sell/test`, `buy/test` and so
+on. The runner reads the copy's `module` rows and runs the tests of the
+version **deployed in the source database**; other versions on disk are
+ignored. Module names are not case sensitive, and a name the server does
+not hold is taken as a path fragment.
+
+- `<Package>@<version>` deploys that installed version into the
+  throwaway copy before running. A failed deploy fails the run.
+- `--package <dir>` installs a working copy into a scratch modules
+  directory (`test/.artifacts/modules`, holding copies of the other
+  deployed packages) and deploys it into the copy, so tests can run before
+  anything is packaged. The server's own modules directory is not
+  touched.
+
+Module tests run against the server's real modules directory
+(`modulesDir`, or `FB_TEST_MODULES`). They reach the harness as
+`require("featherbone-test")`, which the runner resolves through
+`NODE_PATH` (`test/export`):
+
+```js
+const {http, db, env, fixtures, golden} = require("featherbone-test");
+const {matchGolden} = golden.at(__dirname);   // ./golden/<name>.json
+```
+
+That module is a public interface: changing what it exports breaks every
+package's tests. `fixtures` holds only builders over framework feathers;
+a module keeps its own (SupplyChain's are in `common/test/lib`).
+
+### The seed databases
+
+Integration runs clone a **seed**, built by `test/seed.js` from the
+installers themselves and named in `test/seed.json`. Nobody uses them, so
+what the tests see does not move with somebody's `demo`: the golden files,
+the module versions and the data all come from the pins.
+
+| Seed | Database | Holds | Used by |
+| --- | --- | --- | --- |
+| `core` | `featherbone_test_core` | Core, and the `FbtModel` fixture package (`test/fixtures/modules`) | the framework's api tests, with their goldens in `test/golden` |
+| `supplychain` | `featherbone_test_supplychain` | Core, and the SupplyChain version pinned | each package's tests, with their goldens in the package |
+
+The two phases of a run clone their own seed, so the framework's tests
+never see a module and a module's tests never see another's. `FbtModel`
+gives the framework tests feathers shaped like a module's (`FbtTerms`,
+`FbtCategory`, `FbtLocation`) to exercise the data API with, in place of
+borrowing SupplyChain's.
+
+```text
+node test/seed.js            build them if missing or out of date
+node test/seed.js core       one of them
+node test/seed.js --force    build them again
+```
+
+The runner does the first itself. "Out of date" is the Core version, a
+hash of `scripts/`, the pins and, for a package kept in the tests, its
+files, recorded in the database's comment; a change to server code that
+makes different SQL without touching those needs `--force`. The pinned
+packages must be installed on the server (`node install.js --package
+<dir>`), and the build says so when one is not.
+
+To move to a new SupplyChain: install it, change the pin, run the suite,
+and regenerate the package's goldens (`FB_UPDATE_GOLDEN=1`) -- the diff is
+the review. A pin moves only the SupplyChain goldens, never Core's.
+`FB_TEST_SOURCE_DB=demo` still points every phase at one other database,
+for trying a real one; goldens are only expected to match the seeds.
+
+Goldens are plain Postgres output. They were regenerated on Postgres 16;
+if one differs on yours for no reason in the code, say so.
 
 Integration runs clone the source database into a throwaway copy, start a
 Featherbone server on its own port against that copy, run the test files
 one at a time, then stop the server and drop the copy. Nothing touches the
 source database. A full run takes about five minutes.
 
+**Connections to the source stop template copies.** The clone
+itself copes with a busy source -- `CREATE DATABASE ... TEMPLATE` needs no
+other connections, and the harness falls back to `pg_dump | pg_restore`,
+which needs those tools on the path -- but `api/deploy.test.js` makes a
+template copy of the source for its own claims, and Postgres refuses that
+outright while anything is connected ("source database ... is being
+accessed by other users"). Nine of its claims fail for that reason alone.
+The seeds have no users, so with them this does not come up; it can with
+`FB_TEST_SOURCE_DB=demo` and a server or pgAdmin session open on `demo`.
+
 The Postgres user in `server/config.json` must be able to `CREATE DATABASE`
 and `CREATE ROLE` (the tests create login roles for their test users).
-The clone uses `CREATE DATABASE ... TEMPLATE`, which needs no other
-connections on the source; if the source is in use (for example your dev
-server is running), the harness falls back to `pg_dump | pg_restore`, which
-needs those tools on the path.
 
 Settings, all optional:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FB_TEST_SOURCE_DB` | `demo` | Database to clone from |
+| `FB_TEST_SOURCE_DB` | the seeds | Database every phase clones, instead of its seed |
 | `FB_TEST_DB` | `featherbone_test` | Throwaway copy (dropped afterwards) |
 | `FB_TEST_PORT` | `3990` | Port for the test server |
 | `FB_TEST_PGHOST`, `FB_TEST_PGPORT`, `FB_TEST_PGUSER`, `FB_TEST_PGPASSWORD` | from `server/config.json` | Postgres connection |
+| `FB_TEST_MODULES` | `modulesDir` from config | Packages directory the module tests come from |
 | `FB_TEST_KEEP_DB=1` | | Keep the copy after the run for inspection |
 | `FB_UPDATE_GOLDEN=1` | | Rewrite golden files instead of comparing |
-| `FB_TEST_REPORTER` | `test/harness/reporter.js` | Any `node --test` reporter, e.g. `spec` (stock output, lists every todo's stack trace at the end) or `tap` |
+| `FB_TEST_SKIP` | | Comma separated path fragments to leave out, for a file too slow to sit through: `FB_TEST_SKIP=upgrade` runs everything but `api/upgrade.test.js` (and `unit/upgrade.test.js`, which matches the same fragment). Skipped files are named at the start of the run, so a green run cannot quietly be a partial one |
+| `FB_TEST_FAILURE_LOG` | `test/.artifacts/failures.log` | Where each failure's full detail is written as it happens |
+| `FB_TEST_REPORTER` | `test/harness/reporter.js` | Any `node --test` reporter, e.g. `spec` (every test, full errors, SQL and stacks) or `tap` |
+
+The default reporter prints results only: one line per test file, then each failure once (test name, the first lines of its message cut to 240 characters, and where in the tests it was thrown), then one set of totals. Known-defect (todo) tests are counted, and any that now pass are named so they can be promoted. Console output from the tests is dropped. Use `FB_TEST_REPORTER=spec` when you need the full detail.
+
+The runner also names each integration file as it starts it, because the
+reporter says nothing about a file until it finishes and a slow one looks
+like a hang. `api/upgrade.test.js` is the slow one: it runs a core upgrade
+per instance, and an upgrade costs what the instance's data costs, so on a
+large `demo` it can run for many minutes.
 
 Server output goes to `test/.artifacts/server-<db>.log`.
+
+Each failure's **full** detail (whole message, stack, and the properties a
+driver error carries, such as a Postgres `code` and `hint`) is appended to
+`test/.artifacts/failures.log` the moment it happens, so a failure can be
+read, or followed with `tail -f`, while a long file is still running. The
+summary above is clipped and comes last. The log is emptied at the start of
+each run, and `FB_TEST_FAILURE_LOG` moves it.
+
+**A run that is interrupted can leave state behind.** `api/module-install.test.js`
+installs a fixture package into the packages directory and removes it in its
+`after`; kill the run before that and the next one reports "nothing reached
+the disk" against a package that is still there. `rm -rf
+test/fixtures/modules/FbtWebInstall` clears it.
 
 ## Layout
 
@@ -55,23 +161,21 @@ test/unit/               no database: common/ helpers, client/state.js
 test/api/                framework over HTTP: auth, users, authorization,
                          crud, query, locking, catalog, settings, workbooks,
                          schema (SQL-level), security
-test/supplychain/        flows over HTTP: purchasing, inventory, count,
-                         design (BOM, costing), manufacturing, sales,
-                         shipping, billing, planning
+test/export/             featherbone-test, the harness as module tests see it
 test/golden/             snapshots (catalog, schema, workbook and component
                          shapes); commit them
 ```
 
 Every file builds its own data with an `RT-`-style unique prefix, so the
-tests pass on a clone of the demo database and on a fresh install, and files
+tests pass on a clone of the seed and on a fresh install, and files
 can run alone or together in one server.
 
 ## Lint
 
 `unit/lint.test.js` runs the project's own JSLint (`client/jslint.mjs`)
 over every JavaScript file, skipping `node_modules`, `vendor`, the
-generated `client/clientmin.js`, the linter itself and `test/supplychain`
-(those modules, and their tests, live in their own repositories). Not every file is
+generated `client/clientmin.js`, the linter itself and the packages under
+`modules` (they, and their tests, live in their own repositories). Not every file is
 clean yet, so it is a ratchet: `test/lint-baseline.json` records the
 warnings each file is known to have, no file may exceed its entry, and a
 file with no entry (a new one) must have none. Fixing warnings never
@@ -101,12 +205,13 @@ file) and commit.
 
 Copy the shape of an existing file. Integration files get a signed-in
 session with `const admin = await signedIn();` (from `harness/http.js`),
-build data with `harness/fixtures.js` (`configure`, `world`,
-`purchasedItem`, `manufacturedItem`, `cabinetAssembly`, `supplier`,
-`customer`), call routes with `admin.route("/buy/post-purchase-order-receipts",
-body)` and assert with API reads or `db.query(sql, params)`. Some module
-routes start a server process and return before the work is done; the
-`lib/` helpers in each area poll for completion.
+build data with `harness/fixtures.js` (`uniq`, `money`, `address`,
+`currency`, `settings` and the like; a module's tests use its own builders,
+such as SupplyChain's `world` and `purchasedItem`), call routes with
+`admin.route("/buy/post-purchase-order-receipts", body)` and assert with
+API reads or `db.query(sql, params)`. Some module routes start a server
+process and return before the work is done; the `lib/` helpers beside
+those tests poll for completion.
 
 For large structures use `matchGolden("area-thing", value)`; the first run
 writes `test/golden/area-thing.json`, later runs compare. Volatile record

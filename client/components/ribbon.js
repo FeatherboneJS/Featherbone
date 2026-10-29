@@ -131,6 +131,70 @@ const OTHER_CATEGORY = {
 };
 
 /**
+    The ribbon's own title, in place of "Featherbone" once a package's
+    manifest has carried a "title" (brandingSettings, set by
+    installer.js's saveBranding -- see scripts/branding-settings.json).
+
+    @method brandTitle
+    @return {String}
+*/
+function brandTitle() {
+    let models = f.catalog().store().models();
+    let settings = (
+        models.brandingSettings
+        ? models.brandingSettings()
+        : null
+    );
+    let title = (
+        (settings && settings.data && settings.data.title)
+        ? settings.data.title()
+        : ""
+    );
+
+    return title || "Featherbone";
+}
+
+/**
+    The ribbon's own logo, in place of the Featherbone quill mark once
+    a package's manifest has carried a sibling "icon" image
+    (brandingSettings, set by installer.js's saveBranding -- see
+    scripts/branding-settings.json). `""` when none is set, so the
+    caller can fall back to the default quill.
+
+    Unlike the quill (a mask tinted to --fb-text, so it follows the
+    light/dark flip), a package's own icon is drawn at its own colors
+    -- it is a brand mark, not a monochrome glyph, and masking it would
+    just cut a solid-colored silhouette out of whatever shape its
+    opaque pixels happen to form.
+
+    @method brandIcon
+    @return {String}
+*/
+function brandIcon() {
+    let models = f.catalog().store().models();
+    let settings = (
+        models.brandingSettings
+        ? models.brandingSettings()
+        : null
+    );
+    let value = (
+        (settings && settings.data && settings.data.icon)
+        ? settings.data.icon()
+        : ""
+    );
+
+    if (!value) {
+        return "";
+    }
+
+    return (
+        value.startsWith("http")
+        ? value
+        : "/files/upload/" + value
+    );
+}
+
+/**
     The Home tab -- hard-coded rather than reflective of the database,
     unlike the category tabs above (John, Oct 2026). Always the first
     tab; its body is whatever fixed button groups the page rendering
@@ -201,6 +265,7 @@ const HUE_COUNT = 8;
 let selectedTab;      // tab whose buttons are showing
 let lastRoute;        // route selectedTab was last synced to
 let popupOpen = false; // collapsed mode: buttons dropped over the page
+let about;            // the About dialog, one for every page
 let collapsed = (function () {
     try {
         return window.localStorage.getItem(COLLAPSED_KEY) === "true";
@@ -529,6 +594,95 @@ function collapseIcon(isCollapsed) {
     return f.icon(name);
 }
 
+/*
+    How tightly the ribbon is packed, 0 being roomiest.
+
+    Office's behaviour, and the reason for it: a ribbon that will not fit
+    should give up size in stages rather than grow a scrollbar. The
+    scrollbar was the worse answer twice over -- it hid the group labels
+    it sat on top of, and it made buttons reachable only by scrolling a
+    strip nobody expects to scroll.
+
+      0  icon over label, full width
+      1  the same, narrower and tighter
+      2  icons only; the label survives as the tooltip
+
+    Below that there is nothing left to give without hiding buttons
+    outright, so the last stage keeps everything visible and small.
+*/
+const RB_DENSITY_MAX = 2;
+let rbDensity = 0;
+let rbFitting = false;
+let rbWatching = false;
+
+// Which tab the current density was measured for. Switching tabs swaps
+// the whole set of groups, so what fit a moment ago says nothing now.
+let rbMeasuredTab = null;
+
+/*
+    Steps the density up until the ribbon fits, starting from roomiest
+    so that widening the window relaxes it again.
+
+    Measured rather than guessed from breakpoints: what fits depends on
+    how many groups the open tab has, how long their labels are, and the
+    app's zoom, none of which a media query knows about.
+*/
+function rbFit(body) {
+    let tries = 0;
+    let began;
+
+    if (rbFitting || !body) {
+        return;
+    }
+    rbFitting = true;
+    began = rbDensity;
+
+    function step() {
+        let over = body.scrollWidth > body.clientWidth + 1;
+
+        tries += 1;
+        if (over && rbDensity < RB_DENSITY_MAX) {
+            rbDensity += 1;
+            body.classList.remove(
+                "fb-rb-density-0",
+                "fb-rb-density-1",
+                "fb-rb-density-2"
+            );
+            body.classList.add("fb-rb-density-" + rbDensity);
+            if (tries <= RB_DENSITY_MAX) {
+                window.requestAnimationFrame(step);
+                return;
+            }
+        }
+        rbFitting = false;
+        /*
+            Only when the density actually moved. The redraw is here to
+            put the class this measured onto the vnode, and redrawing
+            when nothing moved asks for another onupdate, which measures
+            and redraws again: the ribbon redrew every frame for the life
+            of the page, and an input being typed into was re-rendered
+            from its model between keystrokes, which is why a worksheet
+            could not be renamed (John, Oct 2026).
+        */
+        if (rbDensity !== began) {
+            m.redraw();
+        }
+    }
+
+    step();
+}
+
+/*
+    A resize starts again from roomiest: the only way to know a wider
+    window can afford the roomier layout is to try it.
+*/
+function rbRemeasure(body) {
+    rbDensity = 0;
+    body.classList.remove("fb-rb-density-1", "fb-rb-density-2");
+    body.classList.add("fb-rb-density-0");
+    rbFit(body);
+}
+
 /** Large icon-over-label button. */
 function bigButton(item) {
     let opts = {
@@ -696,6 +850,7 @@ ribbon.component = {
         let selectedKey = vm.selected();
         let alertsWb = vm.alertsWorkbook();
         let alertsButton;
+        let aboutButton;
         let whoButton;
         let whoUser = f.currentUser() || {};
         let routeTab = (
@@ -748,7 +903,33 @@ ribbon.component = {
             let homeGroups = attrs.homeGroups || [];
 
             homeGroups.forEach(function (grp) {
-                groups.push(group(grp.label, grp.buttons.map(bigButton)));
+                // A group that belongs at the far end -- View, which is
+                // about the window rather than about the work -- gets
+                // the leftover space pushed in front of it.
+                if (grp.atEnd) {
+                    groups.push(m("div", {class: "fb-rb-fill"}));
+                }
+                groups.push(group(grp.label, grp.buttons.map(
+                    function (item) {
+                        // `render` draws itself (a field, say).
+                        if (item.render) {
+                            return item.render();
+                        }
+                        return (
+                            grp.small
+                            ? smallButton({
+                                icon: item.icon,
+                                label: item.label,
+                                title: item.title,
+                                opts: {
+                                    disabled: item.disabled,
+                                    onclick: item.onclick
+                                }
+                            })
+                            : bigButton(item)
+                        );
+                    }
+                ), {small: grp.small}));
             });
         } else {
             // --- the showing tab's workbooks ---
@@ -920,7 +1101,22 @@ ribbon.component = {
             ]);
         }
 
+        /*
+            Beside the bell: what this instance runs, and the way to
+            its REST API reference.
+        */
+        if (!about) {
+            about = f.createViewModel("AboutDialog");
+        }
+        aboutButton = m("button[type=button]", {
+            class: "fb-ribbon-about",
+            title: "About: versions and the REST API",
+            "aria-label": "About",
+            onclick: about.open
+        }, f.icon("info"));
+
         let showBody = !collapsed || vm.isPopupOpen();
+        let logoSrc = brandIcon();
 
         return m("div", {
             // fb-rb-t-<tab> picks the hue for the tab being shown,
@@ -945,10 +1141,23 @@ ribbon.component = {
                     onclick: vm.goHome
                 }, [
                     m("div", {
-                        class: "fb-ribbon-logo",
+                        class: (
+                            logoSrc
+                            ? "fb-ribbon-logo fb-ribbon-logo-custom"
+                            : "fb-ribbon-logo"
+                        ),
+                        style: (
+                            logoSrc
+                            ? {
+                                "background-image": (
+                                    "url(\"" + logoSrc + "\")"
+                                )
+                            }
+                            : {}
+                        ),
                         "aria-hidden": "true"
                     }),
-                    "Featherbone"
+                    brandTitle()
                 ]),
                 m("div", {
                     class: "fb-ribbon-tabs",
@@ -998,6 +1207,7 @@ ribbon.component = {
                 attrs.topRight || [],
                 whoButton,
                 alertsButton,
+                aboutButton,
                 m("button[type=button]", {
                     class: "fb-ribbon-collapse",
                     title: (
@@ -1024,14 +1234,46 @@ ribbon.component = {
                     id: "fb-ribbon-body",
                     role: "tabpanel",
                     "aria-labelledby": "fb-ribbon-tab-" + vm.selectedTab(),
-                    class: "fb-ribbon-body" + (
+                    class: "fb-ribbon-body fb-rb-density-" + rbDensity + (
                         collapsed
                         ? " fb-ribbon-body-popup"
                         : ""
-                    )
+                    ),
+                    oncreate: function (vnode) {
+                        rbMeasuredTab = vm.selectedTab();
+                        rbRemeasure(vnode.dom);
+                        if (!rbWatching) {
+                            rbWatching = true;
+                            window.addEventListener("resize", function () {
+                                let body = document.getElementById(
+                                    "fb-ribbon-body"
+                                );
+
+                                if (body) {
+                                    rbRemeasure(body);
+                                }
+                            });
+                        }
+                    },
+                    /*
+                        Another tab is another set of groups, so its fit
+                        is measured from scratch; the same tab merely
+                        redrawn is only checked for new overflow, since
+                        resetting on every redraw would make the ribbon
+                        flicker through its stages while someone types.
+                    */
+                    onupdate: function (vnode) {
+                        if (rbMeasuredTab !== vm.selectedTab()) {
+                            rbMeasuredTab = vm.selectedTab();
+                            rbRemeasure(vnode.dom);
+                            return;
+                        }
+                        rbFit(vnode.dom);
+                    }
                 }, groups)
                 : undefined
-            )
+            ),
+            m(f.getComponent("Dialog"), {viewModel: about})
         ]);
     }
 };

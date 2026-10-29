@@ -1,6 +1,6 @@
 {
     "module": "Core",
-    "version": "3.0.0-alpha.2",
+    "version": "3.0.0-alpha.10",
     "files": [
         {
             "type": "execute",
@@ -30,6 +30,10 @@
             "isSystem": false
         },
         {
+            "type": "execute",
+            "path": "scripts/retire-help-links.js"
+        },
+        {
             "type": "feather",
             "path": "scripts/feathers.json"
         },
@@ -37,6 +41,10 @@
             "type": "feather",
             "path": "scripts/feathers-manager.json",
             "target": "manager"
+        },
+        {
+            "type": "execute",
+            "path": "scripts/retire-help-links.js"
         },
         {
             "type": "execute",
@@ -53,6 +61,11 @@
             "path": "scripts/relation-indexes.js"
         },
         {
+            "type": "execute",
+            "path": "scripts/money-functions.js",
+            "target": "instance"
+        },
+        {
             "type": "workbook",
             "path": "scripts/workbooks.json"
         },
@@ -60,6 +73,11 @@
             "type": "settings",
             "name": "globalSettings",
             "path": "scripts/global-settings.json"
+        },
+        {
+            "type": "settings",
+            "name": "brandingSettings",
+            "path": "scripts/branding-settings.json"
         },
         {
             "type": "batch",

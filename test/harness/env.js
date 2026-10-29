@@ -47,8 +47,11 @@ const settings = Object.freeze({
     artifacts: ARTIFACTS,
     goldenDir: path.join(TEST_DIR, "golden"),
     config,
-    // Database the test copy is cloned from
-    sourceDb: env.FB_TEST_SOURCE_DB || "demo",
+    /*
+        Set to clone this database in every phase, instead of the
+        pinned seeds test/seed.js builds (demo, say, to try a real one).
+    */
+    sourceDb: env.FB_TEST_SOURCE_DB || "",
     // Throwaway database the suite runs against
     testDb: env.FB_TEST_DB || "featherbone_test",
     /*
@@ -75,6 +78,12 @@ const settings = Object.freeze({
     pgUser: env.FB_TEST_PGUSER || config.pgUser,
     pgPassword: env.FB_TEST_PGPASSWORD || config.pgPassword,
     port: Number(env.FB_TEST_PORT || 3990),
+    // The packages this server holds for real, which is where the
+    // SupplyChain suites find the code they exercise
+    realModulesDir: path.resolve(
+        ROOT,
+        env.FB_TEST_MODULES || config.modulesDir || "./modules"
+    ),
     keepDb: env.FB_TEST_KEEP_DB === "1",
     updateGolden: env.FB_UPDATE_GOLDEN === "1",
     // Test users: identities in the harness manager. The harness also

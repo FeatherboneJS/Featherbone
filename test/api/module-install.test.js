@@ -22,6 +22,7 @@ const path = require("path");
 const db = require("../harness/db");
 const settings = require("../harness/env");
 const {Session} = require("../harness/http");
+const {flags} = require("../harness/authority");
 
 const PLATFORM = "fbt_webinst_platform";
 const PLAIN = "fbt_webinst_plain";
@@ -29,21 +30,6 @@ const MODULE = "FbtWebInstall";
 
 let work;
 
-function flags(username, data) {
-    return db.withClient(settings.managerDb, (client) => client.query(
-        (
-            "UPDATE identity SET is_org_admin = $2, " +
-            "  is_platform_admin = $3, updated = now(), " +
-            "  updated_by = 'fbtest' " +
-            "WHERE lower(username) = lower($1)"
-        ),
-        [
-            username,
-            data.isOrgAdmin === true,
-            data.isPlatformAdmin === true
-        ]
-    ));
-}
 
 function samplePackage(version, withCode) {
     let file = path.join(work, MODULE + "-" + version + ".zip");
@@ -254,8 +240,8 @@ describe("Install on the Modules page", function () {
         assert.equal(resp.database, settings.testDb);
     });
 
-    it("says what failed, and that the instance is held, when the " +
-            "deployment fails", async function () {
+    it("says what failed, and that nothing was changed, when the " +
+            "deployment fails before committing", async function () {
         let session = await signedIn(PLATFORM);
         let resp = await session.upload(
             "/module/install/x=1",
@@ -285,9 +271,13 @@ describe("Install on the Modules page", function () {
             new RegExp(MODULE + " 9.9.9 was not deployed to "),
             "which package, and where"
         );
+        /*
+            It rolled back before committing, so it is let go rather
+            than held (John, Oct 2026), and the answer says which.
+        */
         assert.match(
             String(resp.body),
-            /held in maintenance/,
+            /Nothing was changed.*open again/,
             "what state it left the instance in"
         );
         assert.equal(await deployed(), "1.1.0", "nothing half applied");

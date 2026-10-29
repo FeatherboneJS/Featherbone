@@ -144,6 +144,29 @@
    exactly what started cutting column headers off with ellipses. Controls
    that need a fixed outer size (buttons, inputs) opt in individually below.
    ========================================================================= */
+/* The whole interface is drawn 25% larger than its CSS sizes say.
+
+   Everything here is in px -- some 500 values of it -- so there is no
+   root font size to raise and no rem to scale: the only lever that moves
+   type, controls, borders and spacing together, in proportion, is zoom.
+   That is exactly what a browser's own zoom does, and the app at a
+   browser's 125% is what this reproduces at 100%, so nobody has to set
+   it per machine to get something that sits properly beside the rest of
+   the desktop. Settled at 1.125 rather than 1.25 by looking at it: the
+   quarter was a shade large (John, Oct 2026).
+
+   A variable rather than a literal so it is one place to change, and so
+   a future preference has something to write to. Browser zoom still
+   works on top of it and compounds, which is the behaviour anybody
+   pressing ctrl-plus expects. */
+:root {
+    --fb-ui-scale: 1.13;
+}
+
+html {
+    zoom: var(--fb-ui-scale);
+}
+
 html,
 body {
     height: 100%;
@@ -1008,6 +1031,272 @@ button:disabled .fb-ipicon,
 .fb-dialog-icon {
   font-size: 18px;
   color: var(--fb-text-muted);
+}
+
+/* A list of checkboxes standing where a single control would in an
+   aligned form. Without this the list is a block, so it drops to the
+   line below its own label and the form stops looking like a form. */
+.fb-dialog-checklist {
+  display: inline-block;
+  vertical-align: top;
+  text-align: left;
+}
+
+.fb-dialog-checklist label {
+  display: block;
+  margin: 0 0 2px 0;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+/* A list somebody picks several things out of, built to stay usable
+   when packages have contributed dozens of them: a filter above, a
+   scrolling list grouped by contributor, and a count below of what is
+   already ticked -- because a filter hides rows, and a hidden ticked
+   row that nobody mentions loses work silently. */
+.fb-dialog-picker {
+  display: inline-block;
+  vertical-align: top;
+  text-align: left;
+  min-width: 260px;
+}
+
+.fb-dialog-picker-filter {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 6px;
+}
+
+/* Targets dialog rows */
+.fb-target-list {
+    max-height: 50vh;
+    overflow-y: auto;
+    margin: 6px 0;
+}
+.fb-target-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 130px 110px 140px;
+    gap: 8px;
+    align-items: center;
+    padding: 3px 0;
+}
+.fb-target-name {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.fb-target-module {
+    font-size: 0.8em;
+    color: var(--fb-text-muted, #6b7280);
+}
+
+.fb-dialog-picker-list {
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px 6px;
+  border: 1px solid var(--fb-border);
+  border-radius: 4px;
+  background: var(--fb-surface);
+}
+
+.fb-dialog-picker-group + .fb-dialog-picker-group {
+  margin-top: 8px;
+}
+
+.fb-dialog-picker-group-label {
+  color: var(--fb-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+.fb-dialog-picker-list label {
+  display: block;
+  margin: 0 0 2px 0;
+  font-weight: 400;
+  cursor: pointer;
+}
+
+.fb-dialog-picker-none,
+.fb-dialog-picker-count {
+  color: var(--fb-text-muted);
+  font-size: 11px;
+}
+
+.fb-dialog-picker-count {
+  margin-top: 4px;
+}
+
+/* Two lists side by side: what a tile could show on the left, what it
+   does show on the right, in the order it shows them. Checkboxes could
+   say which metrics a tile carried but nothing about their order, so a
+   tile's rows read as arbitrary (John, Oct 2026). The right list is the
+   tile, top to bottom, so it is reorderable by drag or by the arrows,
+   and the left is a plain alphabetical list of what is left. */
+/* One grid for both sides rather than two columns side by side, so the
+   four rows -- label, the filter box or the hint that stands in for it,
+   the list, the arrows -- line up across the halves by construction.
+   Side by side they did not: the left side's filter box is taller than
+   the right side's one line of hint, which left the right-hand list
+   starting 8px high (John, Oct 2026). */
+.fb-dual {
+  display: grid;
+  /* Equal halves that may shrink: a long "Group - Metric" must not
+     push the dialog wider than the viewport. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto;
+  gap: 0 12px;
+  text-align: left;
+  width: 100%;
+}
+
+/* No box of its own: its children are the grid's cells, which is what
+   lets the two sides share rows. Each side is pinned to its own column
+   so the cells cannot flow across the halves. */
+.fb-dual-side {
+  display: contents;
+}
+
+.fb-dual-side:first-child > * {
+  grid-column: 1;
+}
+
+.fb-dual-side:last-child > * {
+  grid-column: 2;
+}
+
+/* Row by row, said outright: auto-placement runs forward only, so the
+   second side's cells would otherwise land below the first side's
+   instead of beside them. */
+.fb-dual-side > *:nth-child(1) {
+  grid-row: 1;
+}
+
+.fb-dual-side > *:nth-child(2) {
+  grid-row: 2;
+}
+
+.fb-dual-side > *:nth-child(3) {
+  grid-row: 3;
+}
+
+.fb-dual-side > *:nth-child(4) {
+  grid-row: 4;
+}
+
+.fb-dual-label {
+  color: var(--fb-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+/* Sits where the left side's filter box does, so the two lists below
+   start at the same height. */
+.fb-dual-hint {
+  color: var(--fb-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 3px 0;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fb-dual-list {
+  height: 240px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 2px;
+  list-style: none;
+  border: 1px solid var(--fb-border);
+  border-radius: 4px;
+  background: var(--fb-surface);
+}
+
+/* The list being dragged into, while it is being dragged into. */
+.fb-dual-list-over {
+  border-color: var(--fb-accent);
+}
+
+.fb-dual-row {
+  padding: 3px 6px;
+  border-radius: 3px;
+  cursor: grab;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* The insertion line is drawn as a border, so every row reserves
+     the space for one and the list does not jump as it moves. */
+  border-top: 2px solid transparent;
+  border-bottom: 2px solid transparent;
+}
+
+.fb-dual-row:hover {
+  background-color: var(--fb-hover-accent-tint);
+}
+
+.fb-dual-row-selected {
+  background-color: var(--fb-selected-bg);
+}
+
+.fb-dual-row-selected:hover {
+  background-color: var(--fb-selected-hover-bg);
+}
+
+.fb-dual-row-drop-before {
+  border-top-color: var(--fb-accent);
+}
+
+.fb-dual-row-drop-after {
+  border-bottom-color: var(--fb-accent);
+}
+
+.fb-dual-empty {
+  padding: 6px;
+  color: var(--fb-text-muted);
+  font-size: 11px;
+}
+
+/* The buttons under each list. Arrows sit on the right of the chosen
+   list the way row actions sit on the right of a toolbar. */
+.fb-dual-note {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  min-height: 28px;
+}
+
+/* A dialog field whose control wants the whole width rather than the
+   column beside a label -- the label goes above it instead. */
+.fb-dialog-wide-group > label {
+  display: block;
+  width: auto;
+  text-align: left;
+  margin-bottom: 4px;
+}
+
+/* A reference a row has but cannot be drawn against -- a percentage of
+   zero. Shown rather than left blank: an empty cell among full ones
+   reads as a drawing failure rather than as an answer. */
+.fb-dash-cell-nil {
+  color: var(--fb-text-muted);
+}
+
+/* A sentence under a dialog's fields saying what the setting is for.
+   Narrow on purpose: prose set the full width of a dialog is a wall. */
+.fb-dialog-note {
+  max-width: 34em;
+  margin-top: 12px;
+  color: var(--fb-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .fb-filter-dialog-input {
@@ -1991,6 +2280,26 @@ button:disabled .fb-ipicon,
   flex: 1 1 auto;
 }
 
+/* The home banner's layout switcher, past the fill -- same input
+   dressing as .fb-rb-field-input, sized for a layout name rather than
+   a zoom percent. */
+.fb-layout-picker {
+  box-sizing: border-box;
+  height: var(--fb-control-height);
+  max-width: 220px;
+  padding: 0 6px;
+  font-size: 13px;
+  background-color: var(--fb-surface);
+  color: var(--fb-text);
+  border: 1px solid var(--fb-border);
+  border-radius: 4px;
+}
+
+.fb-layout-picker:focus {
+  outline: none;
+  border-color: var(--fb-accent);
+}
+
 /* Wraps the record buttons only so positionToolbarCenter() has a
    single element whose right edge marks the end of the toolbar's
    left-side content (title + these buttons), without having to know
@@ -2141,6 +2450,61 @@ button:disabled .fb-ipicon,
   margin: 0;
   accent-color: var(--fb-accent);
   cursor: pointer;
+}
+
+/* A field standing among a ribbon group's buttons, the same height so
+   the row still reads as one row. Used by the View group's zoom
+   percent: a slider for that sat inside the thing it was scaling and
+   moved under the pointer as it was dragged, which a typed number
+   does not. */
+.fb-rb-field {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 0 6px;
+}
+
+/* Dressed as every other text field in the app -- same border, radius,
+   surface and type -- rather than the browser's bare default, which
+   stood out like a hole in the ribbon. */
+.fb-rb-field-input {
+  box-sizing: border-box;
+  width: 56px;
+  height: var(--fb-control-height);
+  padding: 0 6px;
+  text-align: center;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  background-color: var(--fb-surface);
+  color: var(--fb-text);
+  border: 1px solid var(--fb-border);
+  border-radius: 4px;
+}
+
+.fb-rb-field-input:focus {
+  outline: none;
+  border-color: var(--fb-accent);
+}
+
+.fb-rb-field-label {
+  font-size: 11px;
+  color: var(--fb-text-secondary);
+}
+
+/* One row of a stacked small-button group. */
+.fb-rb-field-sm {
+  flex-direction: row;
+  justify-content: flex-start;
+  gap: 4px;
+  height: 22px;
+  padding: 0 6px;
+}
+
+.fb-rb-field-sm .fb-rb-field-input {
+  width: 48px;
+  height: 20px;
 }
 
 .fb-zoom-icon {
@@ -2459,6 +2823,32 @@ button:disabled .fb-ipicon,
     overflow: hidden;
 }
 
+/* A form page: toolbar and title, then the form itself, which takes
+   whatever height is left and scrolls inside it. The form's own rule
+   (.fb-form-content: absolute, 100% high) is measured from the whole
+   layout, ribbon included, while the form starts below the ribbon,
+   toolbar and title -- so its bottom, and the scrollbar with it, ended
+   up past the bottom of the window and anything tall (a long form, the
+   timeline chart) could not be scrolled into view (John, Oct 2026). The
+   script that used to size it to the room left over is commented out in
+   form-widget.js; this does it without script. */
+.fb-ribbon-page-form {
+    display: flex;
+    flex-direction: column;
+}
+
+.fb-ribbon-page-form > * {
+    flex: 0 0 auto;
+}
+
+.fb-ribbon-page-form > .fb-form-content {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+    width: auto;
+}
+
 /* The toolbar above the grid: worksheet title, Record/List buttons,
    search box. min-width reserves a constant block for the title so the
    buttons after it land at the same spot for every worksheet -- a
@@ -2673,6 +3063,22 @@ button:disabled .fb-ipicon,
     mask-position: center;
 }
 
+/* A package's own icon (brandingSettings.icon, set by installer.js's
+   saveBranding -- see scripts/branding-settings.json), in place of the
+   quill above. Not a mask: a brand mark is drawn at its own colors, so
+   this turns the mask off and paints the image as an ordinary
+   background instead -- the same technique as the dashboard
+   wallpaper, just at icon size. ribbon.js adds this modifier class
+   only once a custom icon is actually set. */
+.fb-ribbon-logo-custom {
+    background-color: transparent;
+    -webkit-mask-image: none;
+    mask-image: none;
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
 .fb-ribbon-tabs {
     display: flex;
     gap: 2px;
@@ -2854,6 +3260,111 @@ button:disabled .fb-ipicon,
     color: var(--rb-hue, var(--fb-accent));
 }
 
+/* About: same permanent icon-button shape as the bell */
+.fb-ribbon-about {
+    align-self: center;
+    margin-bottom: 4px;
+    margin-right: 4px;
+    padding: 2px;
+    color: var(--fb-text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.fb-ribbon-about:hover {
+    color: var(--fb-text);
+    background: var(--fb-hover-neutral-tint);
+}
+
+.fb-ribbon-about .material-icons-outlined {
+    display: block;
+    font-size: 24px;
+    width: 24px;
+    height: 24px;
+    line-height: 24px;
+}
+
+.fb-about-name {
+    margin: 0 0 4px;
+}
+
+.fb-about-description {
+    margin: 0 0 12px;
+    color: var(--fb-text-muted);
+}
+
+.fb-about-table {
+    width: 100%;
+    margin-bottom: 12px;
+    border-collapse: collapse;
+}
+
+.fb-about-table caption {
+    padding: 0 0 2px;
+    text-align: left;
+    font-size: 0.8em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fb-text-muted);
+}
+
+.fb-about-table td {
+    padding: 2px 0;
+    border-bottom: 1px solid var(--fb-border);
+}
+
+.fb-about-table .fb-about-version {
+    padding-left: 12px;
+    text-align: right;
+}
+
+.fb-about-child td:first-child {
+    padding-left: 20px;
+}
+
+.fb-about-parent {
+    cursor: pointer;
+}
+
+.fb-about-parent:hover {
+    background: var(--fb-hover-neutral-tint);
+}
+
+.fb-about-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0;
+    font: inherit;
+    color: inherit;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+
+.fb-about-toggle .material-icons-outlined {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+    line-height: 18px;
+}
+
+.fb-about-count {
+    margin-left: 6px;
+    padding: 0 6px;
+    font-size: 0.8em;
+    color: var(--fb-text-muted);
+    border: 1px solid var(--fb-border);
+    border-radius: 8px;
+}
+
+.fb-about-error {
+    color: var(--fb-danger);
+}
+
 /* The ribbon proper. The label band along the bottom is painted by the body
    itself, so it runs the full width even past the last group.
    100 = 1 border + 74 buttons + 24 label band + 1 border. */
@@ -2868,8 +3379,54 @@ button:disabled .fb-ipicon,
     );
     border-top: 1px solid var(--rb-line);
     border-bottom: 1px solid var(--fb-border);
+    /* A last resort, not the plan. The ribbon gives up size in stages
+       (see the density classes below) before it ever scrolls, so this
+       only appears when even icon-only buttons cannot fit -- and thin,
+       so it does not sit on top of the group labels it used to cover. */
     overflow-x: auto;
     overflow-y: hidden;
+    scrollbar-width: thin;
+}
+
+/* =========================================================================
+   Ribbon density -- Office's idea: when the window narrows, the ribbon
+   condenses in stages rather than growing a scrollbar. Which stage is in
+   force is measured and set by ribbon.js, because what fits depends on
+   how many groups the open tab has, their labels, and the app's zoom --
+   none of which a media query can see.
+
+   Stage 1: the same buttons, narrower and tighter.
+   Stage 2: icons only; the label survives as the tooltip, and the group
+   labels in the band below carry the wayfinding.
+   ========================================================================= */
+.fb-rb-density-1 .fb-rb-btn {
+    width: 62px;
+    font-size: 11px;
+    line-height: 13px;
+}
+
+.fb-rb-density-1 .fb-rb-buttons {
+    gap: 1px;
+    padding: 4px 3px 0;
+}
+
+.fb-rb-density-2 .fb-rb-btn {
+    width: 40px;
+    justify-content: center;
+    padding-top: 0;
+}
+
+.fb-rb-density-2 .fb-rb-btn span {
+    display: none;
+}
+
+.fb-rb-density-2 .fb-rb-buttons {
+    gap: 1px;
+    padding: 4px 3px 0;
+}
+
+.fb-rb-density-2 .fb-rb-field-label {
+    display: none;
 }
 
 /* Collapsed mode: the body drops down over the page instead of pushing it. */
@@ -3271,6 +3828,35 @@ button:disabled .fb-ipicon,
   margin-top: 4px;
 }
 
+/* The pane below the users is two tabs: the organization's recent
+   changes and the selected person's roles in this instance. The strip
+   is the form tab strip (.fb-form-tabs), so it needs only the margin
+   that puts it where the "Recent changes" title used to sit. */
+.fb-admin-tabs {
+  margin: 8px 8px 0 8px;
+}
+
+/* The roles tab's own actions, over that list and nothing else -- the
+   same arrangement the platform console's panels use. */
+.fb-admin-roles-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 8px 6px 8px;
+}
+
+.fb-admin-role-picker {
+  min-width: 14em;
+  max-width: 22em;
+}
+
+/* An inherited membership is shown but is not the person's to lose, so
+   it reads as a second group rather than as another row of the first. */
+.fb-admin-role-inherited td {
+  font-style: italic;
+  opacity: 0.75;
+}
+
 /* The picker and the platform console (tenant plan G.1-G.3), which are
    their own page rather than part of the application bundle. */
 /* The console is a full-height column: its two lists share what the
@@ -3378,11 +3964,32 @@ button:disabled .fb-ipicon,
     --fb-dash-band-3: #f1f1f1;
     --fb-dash-band-4: #f7f7f7;
     --fb-dash-band-5: #fbfbfb;
-    --fb-dash-measure: var(--fb-text);
-    --fb-dash-marker: var(--fb-text);
-    --fb-dash-bar: #9a9a9a;
-    --fb-dash-spark: var(--fb-text);
+    /* Colour on this board encodes rather than decorates, which is the
+       only kind Few has no argument with.
+
+       The measure and its comparison are two different kinds of thing --
+       what happened, and what it is being judged against -- so they are
+       told apart by hue as well as by shape: a deep teal bar under a
+       warm amber marker, which are near enough complementary to be
+       unmistakable at a glance and dark enough to stay legible on a
+       white card. Within a tile the bars remain one hue, so nothing
+       suggests that South and West are different KINDS of thing.
+
+       Deliberately not --fb-accent: that blue means "you can click
+       this" everywhere else in the app, and data is not clickable. */
+    --fb-dash-measure: #0d6e74;
+    --fb-dash-marker: #a8560f;
+    /* Near-black rather than a third hue. Two hues on a tile is a
+       scheme; three is a chart that has to be decoded. The target is
+       told apart by its shape -- full height and dashed -- which also
+       survives being printed or being looked at by somebody who cannot
+       tell teal from amber. */
+    --fb-dash-target: #2b2f36;
+    --fb-dash-bar: #6aa6aa;
+    --fb-dash-spark: #5c8f93;
     --fb-dash-spark-band: #ededed;
+    /* Third series in a histogram: the same teal, lighter still. */
+    --fb-dash-light: #a9cdd0;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -3392,8 +3999,15 @@ button:disabled .fb-ipicon,
         --fb-dash-band-3: #2c3038;
         --fb-dash-band-4: #262a31;
         --fb-dash-band-5: #21242a;
-        --fb-dash-bar: #7c838d;
+        /* Lifted and desaturated for a dark ground: the same two hues,
+           at the lightness a dark surface needs to keep contrast. */
+        --fb-dash-measure: #4fb3b8;
+        --fb-dash-marker: #e09a5a;
+        --fb-dash-target: #e8eaed;
+        --fb-dash-bar: #3f7f83;
+        --fb-dash-spark: #74a9ad;
         --fb-dash-spark-band: #2a2e35;
+        --fb-dash-light: #2d5b5e;
     }
 }
 
@@ -3419,6 +4033,15 @@ button:disabled .fb-ipicon,
     stroke-width: 2;
 }
 
+/* The target: full height where the comparison is a short bar, so the
+   two never have to be told apart by colour alone, and reading as a
+   threshold the bar either reaches or does not. */
+.fb-dash-bullet-target {
+    stroke: var(--fb-dash-target);
+    stroke-width: 2;
+    stroke-dasharray: 3 2;
+}
+
 .fb-dash-spark-line {
     stroke: var(--fb-dash-spark);
     stroke-width: 1;
@@ -3434,6 +4057,93 @@ button:disabled .fb-ipicon,
 .fb-dash-bar { fill: var(--fb-dash-bar); }
 .fb-dash-bar-emphasis { fill: var(--fb-dash-measure); }
 
+/* Expected but not landed: the measure's hue, paler. */
+.fb-dash-bullet-pending {
+    fill: var(--fb-dash-measure);
+    fill-opacity: 0.35;
+}
+
+/* Alerts: one shape, one hue, urgency by intensity. */
+.fb-dash-alert { display: block; }
+.fb-dash-alert-dot { fill: var(--fb-danger); }
+.fb-dash-alert-1 { fill-opacity: 0.4; }
+.fb-dash-alert-2 { fill-opacity: 1; }
+.fb-dash-cell-alert { width: 14px; }
+
+/* Due-date histogram. Series by intensity of one hue; late in the alert
+   hue at the same intensities, so a red bar still says which series. */
+.fb-dash-hist-plot {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+}
+.fb-dash-columns { display: block; }
+.fb-dash-hist-s0 { fill: var(--fb-dash-measure); }
+.fb-dash-hist-s1 { fill: var(--fb-dash-bar); }
+.fb-dash-hist-s2 { fill: var(--fb-dash-light); }
+.fb-dash-hist-late { fill: var(--fb-danger); }
+.fb-dash-hist-late.fb-dash-hist-s1 { fill-opacity: 0.65; }
+.fb-dash-hist-late.fb-dash-hist-s2 { fill-opacity: 0.38; }
+.fb-dash-hist-now {
+    stroke: var(--fb-dash-target);
+    stroke-width: 1.5;
+    stroke-dasharray: 3 2;
+}
+.fb-dash-hist-notes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 12px;
+}
+.fb-dash-hist-key {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+.fb-dash-hist-swatch {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+}
+span.fb-dash-hist-s0 { background: var(--fb-dash-measure); }
+span.fb-dash-hist-s1 { background: var(--fb-dash-bar); }
+span.fb-dash-hist-s2 { background: var(--fb-dash-light); }
+span.fb-dash-hist-late { background: var(--fb-danger); }
+/* Same per-series dimming as the bars (fill-opacity above), in the
+   non-SVG property a swatch span needs instead. */
+span.fb-dash-hist-late.fb-dash-hist-s1 { opacity: 0.65; }
+span.fb-dash-hist-late.fb-dash-hist-s2 { opacity: 0.38; }
+.fb-dash-hist-earlier { color: var(--fb-danger); }
+
+/* Small multiples grid */
+.fb-dash-multiples {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 6px 12px;
+    overflow: hidden;
+}
+.fb-dash-multiple {
+    min-width: 0;
+}
+.fb-dash-multiple-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.85em;
+    white-space: nowrap;
+    overflow: hidden;
+}
+.fb-dash-multiple-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.fb-dash-multiple-value {
+    font-size: 0.85em;
+    font-variant-numeric: tabular-nums;
+}
+.fb-dash-multiple .fb-dash-spark {
+    width: 100%;
+}
+
 .fb-dash-axis-line {
     stroke: var(--fb-text-muted);
     stroke-width: 1;
@@ -3444,33 +4154,241 @@ button:disabled .fb-ipicon,
     font-size: 9px;
 }
 
-/* The board. A fixed grid mapped onto whatever space the page gives it, so
-   a tile cannot be placed outside the viewport -- there is nowhere outside
-   it to go. Groups are delineated by white space (the gap) and NOT by
-   borders or fills, which is Few's "least visible means" rule: a border
-   earns its place only where density leaves no room for space. */
+/* The scrolling frame around the board -- fixed height (whatever space
+   the page gives it, same as the board used to claim directly), with
+   .fb-dash-board free to grow taller than that inside it once a tile
+   push runs past DASH_ROWS. Columns still have nowhere outside the
+   viewport to go, so only this scrolls, and only vertically. */
+.fb-dash-viewport {
+    flex: 1;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+
+/* The board. A grid, DASH_COLS wide and at least DASH_ROWS tall (see
+   dashboard.js), each row a fixed height set inline so a board with more
+   rows gets taller rather than squeezing every row down to fit. Groups
+   are delineated by white space (the gap) and NOT by borders or fills,
+   which is Few's "least visible means" rule: a border earns its place
+   only where density leaves no room for space. */
 .fb-dash-board {
     display: grid;
     gap: 14px;
     padding: 14px;
-    height: 100%;
     box-sizing: border-box;
     background: var(--fb-bg);
 }
 
+/* Wraps the home page's title/picker bar and the dashboard frame
+   together (see client/main.js's home view), so a package's wallpaper
+   (wallpaperStyle() in dashboard.js) paints once as a single backdrop
+   behind both instead of two separate fills that would restart -- and
+   not line up -- at the board's own edge. z-index: 0 gives this its
+   own stacking context, so the dark-mode scrim below (z-index: -1) is
+   pinned between this element's own background-image and everything
+   inside it, regardless of how any of those children are positioned,
+   rather than depending on which of them happen to also be
+   positioned. */
+.fb-dash-page {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    box-sizing: border-box;
+    position: relative;
+    z-index: 0;
+}
+
+/* With a wallpaper set, the board itself goes fully transparent -- the
+   tiles are their own opaque cards floating over the image, same as
+   over any photo, so the gaps between them show it plainly. Scoped to
+   the "-wallpaper" modifier (added only when wallpaperStyle() returns
+   an image), so a page with no wallpaper keeps its normal surface. */
+.fb-dash-page-wallpaper .fb-dash-board {
+    background: transparent;
+}
+
+/* The title row is text sitting directly over the image, not a card --
+   going fully transparent there (as the board does) left the title
+   fighting whatever the wallpaper was doing behind it. Instead the
+   banner stays a crisp surface on the left, where the name is, and
+   dissolves toward the right, letting the image come through behind
+   the empty middle and the layout picker. The As Of line below it
+   stays plain over the image, like the board. The picker keeps its
+   own opaque surface, same as a tile. */
+.fb-dash-page-wallpaper .fb-toolbar-home {
+    background: linear-gradient(
+        to right,
+        var(--fb-surface) 0%,
+        var(--fb-surface) 25%,
+        color-mix(in srgb, var(--fb-surface) 60%, transparent) 45%,
+        transparent 75%
+    );
+}
+
+/* A wallpaper is a photo, and a photo doesn't dim itself just because
+   the rest of the UI went dark -- at full brightness it fights every
+   dark surface around it instead of sitting quietly behind the title,
+   the As Of line, and the tiles alike. */
+@media (prefers-color-scheme: dark) {
+    .fb-dash-page-wallpaper::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: -1;
+        background: rgba(0, 0, 0, 0.45);
+        pointer-events: none;
+    }
+}
+
+/* Each tile is a surface floating over the page's background rather
+   than a region of it. The point is not decoration: a tile has no other
+   boundary, and without one the eye has to work out from spacing alone
+   which heading owns which numbers. Surface and background are both
+   variables, so this inverts in dark mode -- a lighter card on darker
+   ground -- rather than being white anywhere. */
 .fb-dash-tile {
     display: flex;
     flex-direction: column;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
+    /* The resize grip sits in the corner of this box. */
+    position: relative;
+    padding: 12px 14px;
+    box-sizing: border-box;
+    background: var(--fb-surface);
+    border: 1px solid var(--fb-border-subtle);
+    border-radius: 10px;
+    /* Shallow and soft. A card that looks like it is hovering a
+       centimetre off the page turns a quiet board into a noisy one. */
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+    .fb-dash-tile {
+        border-color: var(--fb-border);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+    }
 }
 
 .fb-dash-tile-heading {
+    display: flex;
+    align-items: baseline;
     font-size: 12px;
     font-weight: 600;
     color: var(--fb-text-secondary);
     margin-bottom: 8px;
+}
+
+/* The tile's top corner, opposite the resize grip. It sat beside the
+   heading while a tile had no boundary -- adjacency was the only thing
+   saying which tile a control belonged to -- but a tile is a card with
+   an edge now, so the corner says it and the heading is left to be a
+   heading. */
+.fb-dash-tile-remove {
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    padding: 0 2px;
+    border: none;
+    background: none;
+    color: var(--fb-text-muted);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+    /* Invisible rather than absent: appearing on hover must not move
+       anything, and a board being read should not be a board covered in
+       buttons. */
+    opacity: 0;
+    transition: opacity 120ms ease-in;
+}
+
+.fb-dash-tile:hover .fb-dash-tile-remove,
+.fb-dash-tile-remove:focus {
+    opacity: 1;
+}
+
+.fb-dash-tile-remove:hover {
+    color: var(--fb-danger);
+}
+
+/* Same corner, one spot to the left of Remove. */
+.fb-dash-tile-edit {
+    position: absolute;
+    top: 4px;
+    right: 22px;
+    padding: 0 2px;
+    border: none;
+    background: none;
+    color: var(--fb-text-muted);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 120ms ease-in;
+}
+
+.fb-dash-tile:hover .fb-dash-tile-edit,
+.fb-dash-tile-edit:focus {
+    opacity: 1;
+}
+
+.fb-dash-tile-edit:hover {
+    color: var(--fb-accent);
+}
+
+/* The heading is the handle, so it says so by the cursor rather than by
+   growing a grip. Its text is not selectable: dragging across a heading
+   should move the tile, not highlight the words. */
+.fb-dash-tile-heading {
+    cursor: grab;
+    user-select: none;
+}
+
+.fb-dash-tile-dragging .fb-dash-tile-heading {
+    cursor: grabbing;
+}
+
+/* Faded rather than hidden while it is being dragged, so the board
+   still reads as a whole and the tile is visibly the thing moving. */
+.fb-dash-tile-dragging {
+    opacity: 0.55;
+}
+
+/* The corner grip. Two short strokes drawn with a gradient rather than
+   an icon, so it costs nothing and scales with the app. */
+.fb-dash-tile-resize {
+    position: absolute;
+    right: 2px;
+    bottom: 2px;
+    width: 14px;
+    height: 14px;
+    cursor: nwse-resize;
+    opacity: 0;
+    transition: opacity 120ms ease-in;
+    background: linear-gradient(
+        135deg,
+        transparent 0 45%,
+        var(--fb-text-muted) 45% 55%,
+        transparent 55% 70%,
+        var(--fb-text-muted) 70% 80%,
+        transparent 80%
+    );
+}
+
+.fb-dash-tile:hover .fb-dash-tile-resize {
+    opacity: 0.7;
+}
+
+/* Where a dragged tile would land. Drawn in the grid itself, so it
+   cannot disagree with where the tile actually goes. */
+.fb-dash-drop {
+    border: 2px dashed var(--fb-dash-measure);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--fb-dash-measure) 8%, transparent);
+    pointer-events: none;
 }
 
 .fb-dash-tile-empty {
@@ -3478,19 +4396,106 @@ button:disabled .fb-ipicon,
     font-size: 12px;
 }
 
-/* No gridlines and no striping: both are non-data pixels that make a short
-   table harder to scan, not easier. */
-.fb-dash-kpi-table {
-    border-collapse: collapse;
+/* The board and its status line share a column, so the line takes the
+   height it needs and the grid takes the rest. flex: 1 rather than
+   height: 100% -- this now sits below the title/picker row inside
+   .fb-dash-page's own flex column (see client/main.js's home view),
+   so it needs to take the REMAINING space there, not the whole of it. */
+.fb-dash-frame {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    box-sizing: border-box;
 }
 
-.fb-dash-kpi-table td {
+/* What Refresh is doing, or how old the figures are: one quiet line, said
+   once, above the board rather than repeated on every tile. */
+.fb-dash-refresh-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    padding: 6px 14px 0 14px;
+    font-size: 11px;
+}
+
+.fb-dash-refresh-note {
+    color: var(--fb-text-muted);
+}
+
+/* The reporting date, when the board has been pinned to one. Weighted
+   rather than muted, because a board showing a date other than today has
+   to say so where the eye lands first -- figures from another quarter are
+   indistinguishable from wrong figures otherwise. Not the loud
+   .fb-env-banner treatment: pinning is a legitimate thing to do, not a
+   hazard. */
+.fb-dash-as-of {
+    color: var(--fb-text);
+    font-weight: 600;
+}
+
+/* Red is reserved for things that are wrong, which this is. */
+.fb-dash-refresh-fail {
+    color: var(--fb-danger);
+}
+
+/* No gridlines and no striping: both are non-data pixels that make a short
+   table harder to scan, not easier. */
+.fb-dash-kpi-table,
+.fb-dash-measure-table {
+    border-collapse: collapse;
+    /* A flex item stretches to the tile's width by default, which spreads
+       the columns across the whole tile and puts a hand's breadth of empty
+       space between a name and its bar. Data that belongs together is read
+       together, so the table takes the width its content needs. */
+    align-self: flex-start;
+}
+
+.fb-dash-kpi-table td,
+.fb-dash-measure-table td {
     padding: 3px 10px 3px 0;
     vertical-align: middle;
 }
 
+/* A grouped measure tile has no qualitative ranges to show -- there are no
+   targets -- so its bullets carry a single band, which is a plot backdrop
+   and not a judgement. Drawn light, so the measure stays the darkest thing
+   in the row. */
+.fb-dash-measure-table .fb-dash-band-1 {
+    fill: var(--fb-dash-band-4);
+}
+
+/* The tile's own total, stated once beside the heading rather than as
+   another row competing with the members. */
+.fb-dash-tile-total {
+    color: var(--fb-dash-measure);
+    margin-left: 12px;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+}
+
+/* What the marker means, said once under the table. */
+.fb-dash-caption {
+    margin-top: 2px;
+    font-size: 10px;
+    color: var(--fb-text-muted);
+}
+
+.fb-dash-tile-error {
+    font-size: 12px;
+    color: var(--fb-danger);
+}
+
+.fb-dash-cell-pct {
+    text-align: right;
+    white-space: nowrap;
+    color: var(--fb-text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
 .fb-dash-cell-spark { width: 80px; }
 .fb-dash-cell-graphic { width: 150px; }
+.fb-dash-measure-table .fb-dash-cell-graphic { width: 220px; }
 .fb-dash-cell-name { white-space: nowrap; }
 
 .fb-dash-cell-value {
@@ -3512,4 +4517,88 @@ button:disabled .fb-ipicon,
     .fb-dash-tile {
         margin-bottom: 18px;
     }
+}
+
+/* =========================================================================
+   Dashboard drill-down (client/components/drill-dialog.js)
+   -------------------------------------------------------------------------
+   The records behind a figure, in a modal list that fills most of the
+   window: a drill-down with six rows and one with six hundred are the
+   same shape on screen, so the dialog does not jump about as somebody
+   moves from one tile to the next.
+   ========================================================================= */
+.fb-dash-row-drill {
+    cursor: pointer;
+}
+
+.fb-dash-row-drill:hover {
+    background: var(--fb-surface-alt);
+}
+
+/* A histogram bar that drills: SVG has no background to tint, so the bar
+   itself lightens under the pointer. */
+rect.fb-dash-row-drill:hover {
+    opacity: 0.75;
+}
+
+/* The list is given its own height (60vh, in the view model) and the
+   dialog sizes to it, so Close sits under the list rather than below
+   the bottom of the window. */
+.fb-drill-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+
+/* The list may be wider than the dialog -- a worksheet's columns are
+   whatever somebody made them -- so it scrolls sideways inside the
+   dialog instead of being cut off at the edge. */
+.fb-drill-table {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.fb-drill-table .fb-table-scroll {
+    max-width: 100%;
+}
+
+.fb-drill-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.fb-drill-feather {
+    font-size: 12px;
+    color: var(--fb-text-muted);
+    white-space: nowrap;
+}
+
+.fb-drill-tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    border: 1px solid var(--fb-border);
+    border-radius: 4px;
+    background: var(--fb-surface);
+    color: var(--fb-text);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.fb-drill-tool:hover {
+    background: var(--fb-surface-alt);
+}
+
+.fb-drill-tool-disabled,
+.fb-drill-tool-disabled:hover {
+    color: var(--fb-text-muted);
+    cursor: default;
+    background: var(--fb-surface);
+}
+
+.fb-drill-tool-icon {
+    font-size: 16px !important;
 }

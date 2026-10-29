@@ -17,6 +17,7 @@ process.env.TZ = "America/Chicago";
 
 const {describe, it, before, beforeEach, after} = require("node:test");
 const assert = require("node:assert/strict");
+const fsp = require("fs/promises");
 const path = require("path");
 const {pathToFileURL} = require("url");
 const env = require("./lib/browser-env");
@@ -118,7 +119,8 @@ describe("client components", function () {
             "toolbar", "urlWidget", "workbookPage"
         ]);
         assert.deepEqual(Object.keys(vms).sort(), [
-            "accountMenu", "aggregateDialog", "button", "childFormPage",
+            "aboutDialog", "accountMenu", "aggregateDialog", "button",
+            "childFormPage",
             "childTable", "contactRelation", "dialog", "filterDialog",
             "formDialog", "formWidget", "gantt", "helpLinkRelation",
             "navigatorMenu", "relationWidget", "resourceLinkRelation", "ribbon",
@@ -128,6 +130,36 @@ describe("client components", function () {
     });
 
     describe("button.js", function () {
+        /*
+            Same reason as dialog.js above: a button whose view model is
+            swapped acts on the one it is drawn with, not the one it was
+            born with -- otherwise its onclick runs against something
+            nobody can see any more.
+        */
+        it("draws the view model it is handed now", function () {
+            let clicked = [];
+            let first = vms.button({
+                label: "First",
+                onclick: () => clicked.push("first")
+            });
+            let second = vms.button({
+                label: "Second",
+                onclick: () => clicked.push("second")
+            });
+            let vnode = {attrs: {viewModel: first}, tag: comps.button};
+            let state = Object.create(comps.button);
+            let drawn;
+
+            vnode.state = state;
+            state.oninit(vnode);
+            vnode.attrs = {viewModel: second};
+            drawn = state.view.call(state, vnode);
+
+            assert.ok(R.text(drawn).includes("Second"), R.text(drawn));
+            drawn.attrs.onclick({});
+            assert.deepEqual(clicked, ["second"]);
+        });
+
         it("renders label with hot key, icon and title", function () {
             let vm = vms.button({
                 label: "&Save",
@@ -256,6 +288,36 @@ describe("client components", function () {
     });
 
     describe("dialog.js", function () {
+        /*
+            A component reads its view model in oninit, which runs once.
+            Anything that swaps in a new one -- the dashboard, opening a
+            drill-down on a different figure -- gets the new one drawn
+            only if the view prefers what it is handed now. It did not,
+            so a second drill-down showed the first one's title and its
+            Close button closed a dialog that had already gone (John,
+            Oct 2026).
+        */
+        it("draws the view model it is handed now", function () {
+            let first = vms.dialog({message: "First", title: "First"});
+            let second = vms.dialog({message: "Second", title: "Second"});
+            let vnode = {attrs: {viewModel: first}, tag: comps.dialog};
+            let state = Object.create(comps.dialog);
+
+            vnode.state = state;
+            state.oninit(vnode);
+            assert.ok(
+                R.text(R.render(comps.dialog, {viewModel: first}).tree
+                        ).includes("First"),
+                "the one it was made with"
+            );
+
+            vnode.attrs = {viewModel: second};
+            assert.ok(
+                R.text(state.view.call(state, vnode)).includes("Second"),
+                "and the one it is given afterwards"
+            );
+        });
+
         it("renders title, message and Ok/Cancel buttons", function () {
             let vm = vms.dialog({
                 title: "Confirm",
@@ -628,6 +690,98 @@ describe("client components", function () {
             assert.ok(R.text(out.tree).includes("Row 2"));
         });
 
+        /*
+            The page is drawn at html's zoom (--fb-ui-scale), so a height
+            set on the list's scroll box is stretched by it, while
+            innerHeight and the box's top are in real viewport pixels.
+            Treating them as one scale left every list 13% too tall, with
+            its sticky totals footer pinned below the bottom of the window
+            -- the subtotals looked lost. The footer is only on screen if
+            the scroll box, as drawn, ends inside the window.
+        */
+        describe("scroll box height under the page zoom", function () {
+            const TOP = 250;
+            const WINDOW_HEIGHT = 900;
+            let saved;
+
+            function sizedBox(zoom) {
+                let vm = vms.tableWidget({
+                    config: {
+                        aggregates: [{method: "SUM", property: "qty"}],
+                        columns: [{attr: "name"}, {attr: "qty"}]
+                    },
+                    feather: "TestItem",
+                    models: list
+                });
+                let out = R.render(comps.tableWidget, {viewModel: vm});
+                let ids = vm.ids();
+                let box = R.find(out.tree, function (n) {
+                    return R.classOf(n).includes("fb-table-scroll");
+                });
+                let dom = {
+                    getBoundingClientRect: () => ({top: TOP}),
+                    style: {}
+                };
+
+                // The header and the totals footer add their own height
+                // to the box, on top of the room the rows get.
+                globalThis.document.getElementById = function (id) {
+                    if (id === ids.header || id === ids.footer) {
+                        return {offsetHeight: 33};
+                    }
+                    return null;
+                };
+                globalThis.innerHeight = WINDOW_HEIGHT;
+                globalThis.getComputedStyle = () => ({zoom});
+                box.attrs.oncreate({dom});
+                return parseFloat(dom.style.height);
+            }
+
+            before(function () {
+                saved = {
+                    getComputedStyle: globalThis.getComputedStyle,
+                    getElementById: globalThis.document.getElementById,
+                    innerHeight: globalThis.innerHeight
+                };
+            });
+
+            after(function () {
+                globalThis.innerHeight = saved.innerHeight;
+                globalThis.getComputedStyle = saved.getComputedStyle;
+                globalThis.document.getElementById = saved.getElementById;
+            });
+
+            it("ends inside the window at the default 1.13 zoom", function () {
+                let height = sizedBox("1.13");
+
+                assert.ok(
+                    TOP + height * 1.13 <= WINDOW_HEIGHT,
+                    "drawn bottom " + (TOP + height * 1.13) +
+                    " is past the window's " + WINDOW_HEIGHT
+                );
+                assert.ok(height > 400, "and still uses the room: " + height);
+            });
+
+            it("ends inside the window at any zoom", function () {
+                ["1", "1.25", "1.5"].forEach(function (zoom) {
+                    let height = sizedBox(zoom);
+
+                    assert.ok(
+                        TOP + height * Number(zoom) <= WINDOW_HEIGHT,
+                        "zoom " + zoom + ": drawn bottom " +
+                        (TOP + height * Number(zoom)) + " > " + WINDOW_HEIGHT
+                    );
+                });
+            });
+
+            it("is unchanged where the page is not zoomed", function () {
+                let unzoomed = WINDOW_HEIGHT - TOP - 82 + 66;
+
+                assert.equal(sizedBox("1"), unzoomed);
+                assert.equal(sizedBox(undefined), unzoomed);
+            });
+        });
+
         it("runs Mode and Selection statecharts", function () {
             let vm = tableVm();
             assert.deepEqual(vm.state().current().slice(0, 2),
@@ -789,6 +943,95 @@ describe("client components", function () {
             catalog.store().data().navigationCategories = realCats;
             assert.deepEqual(shown, ["Selling"]);
         });
+
+        /*
+            The ribbon measures itself after every draw and tightens its
+            spacing until it fits. Redrawing when it did not have to
+            tighten asks for another measurement, which asks for another
+            redraw: the page redrew every frame for as long as it was
+            open, and an input being typed into was re-rendered from its
+            model between keystrokes -- which is why a worksheet could
+            not be renamed (John, Oct 2026).
+        */
+        it("stops measuring itself once it fits", function () {
+            let out = R.render(comps.ribbon, {viewModel: vms.ribbon()});
+            let body = R.find(out.tree, R.byId("fb-ribbon-body"));
+            let counted;
+            // Wide enough for its contents: nothing to tighten.
+            let roomy = {
+                classList: {add: () => undefined, remove: () => undefined},
+                clientWidth: 1000,
+                scrollWidth: 900
+            };
+
+            assert.ok(body, "the ribbon drew its body");
+            assert.equal(typeof body.attrs.onupdate, "function");
+
+            // The first pass measures a tab it has not seen; the ones
+            // after it are the redraws that used to feed themselves.
+            body.attrs.onupdate({dom: roomy});
+            counted = env.redraws();
+            body.attrs.onupdate({dom: roomy});
+            body.attrs.onupdate({dom: roomy});
+
+            assert.equal(
+                env.redraws() - counted,
+                0,
+                "a ribbon that fits asks for no redraw"
+            );
+        });
+
+        /*
+            The other half of the same rule, and the one with somewhere
+            left to go wrong: a ribbon that does NOT fit has to redraw,
+            because the class it just measured has to reach the vnode.
+            It must still stop once it is as tight as it goes -- the
+            loop only has to survive in one branch to take every text
+            field in the app down with it again.
+        */
+        it("stops once it has tightened as far as it goes",
+                async function () {
+            let out = R.render(comps.ribbon, {viewModel: vms.ribbon()});
+            let body = R.find(out.tree, R.byId("fb-ribbon-body"));
+            let counted;
+            let added = [];
+            // Narrower than its contents at any spacing.
+            let cramped = {
+                classList: {
+                    add: (c) => added.push(c),
+                    remove: () => undefined
+                },
+                clientWidth: 400,
+                scrollWidth: 1600
+            };
+
+            // Each tightening step is deferred to requestAnimationFrame,
+            // which the harness runs as setTimeout(0).
+            function settle() {
+                return new Promise(function (resolve) {
+                    setTimeout(resolve, 0);
+                });
+            }
+
+            body.attrs.onupdate({dom: cramped});
+            await settle();
+            await settle();
+            await settle();
+
+            assert.ok(added.length, "it gave up spacing rather than scroll");
+
+            counted = env.redraws();
+            body.attrs.onupdate({dom: cramped});
+            body.attrs.onupdate({dom: cramped});
+            await settle();
+            await settle();
+
+            assert.equal(
+                env.redraws() - counted,
+                0,
+                "at the tightest spacing there is nothing left to change"
+            );
+        });
     });
 
     describe("pages", function () {
@@ -838,6 +1081,48 @@ describe("client components", function () {
             assert.equal(save.disabled, true, "invalid new record");
             assert.equal(save.title, "\"Name\" is required");
             assert.ok(labels(out.tree).includes("Name:"));
+        });
+
+        /*
+            A form takes the room left under the ribbon, toolbar and title
+            and scrolls inside it. It had been sized to the whole layout
+            (absolute, 100% high) while starting below those, so a form
+            taller than the window ran past the bottom of it, scrollbar
+            and all, and the rest -- a long timeline chart, say -- could
+            not be reached (John, Oct 2026). Layout needs a browser; this
+            pins the two halves: the page marks its frame, and the style
+            for that frame gives the form what is left.
+        */
+        it("form-page.js frames the form to fill the room left under it",
+                async function () {
+            let out = R.render(comps.formPage, {
+                create: true,
+                feather: "test-item",
+                isNew: true,
+                key: "unit-frame"
+            });
+            let frame = R.find(out.tree, R.byClass("fb-ribbon-page-form"));
+            let css = await fsp.readFile(
+                path.resolve(__dirname, "..", "..", "css", "featherbone.css"),
+                "utf8"
+            );
+            let rule = function (selector) {
+                let found = css.match(new RegExp(
+                    selector.replace(/[.>]/g, "\\$&") + "\\s*\\{([^}]*)\\}"
+                )) || [];
+
+                let body = found[1] || "";
+
+                return body.replace(/\s+/g, " ");
+            };
+
+            assert.ok(frame, "the page's frame says it holds a form");
+            assert.ok(R.find(frame, R.byClass("fb-form-content")),
+                    "and the scrolling form is inside it");
+            assert.match(rule(".fb-ribbon-page-form"),
+                    /display: flex; flex-direction: column;/);
+            assert.match(rule(".fb-ribbon-page-form > .fb-form-content"),
+                    /flex: 1 1 auto; min-height: 0; height: auto;/);
         });
 
         it("child-form-page.js edits a child row", function () {
@@ -1013,6 +1298,75 @@ describe("client components", function () {
                     name
                 );
             });
+        });
+    });
+
+    describe("about-dialog.js", function () {
+        it("shows versions and opens the REST reference", async function () {
+            let opened = [];
+            let open = globalThis.open;
+            let vm = vms.aboutDialog();
+            let out;
+            let text;
+
+            env.respond(function (req) {
+                if (req.url === "/demo/about") {
+                    return {
+                        deployedVersion: "2.9.0",
+                        description: "A framework.",
+                        infrastructure: [
+                            {name: "Node.js", version: "22.0.0"},
+                            {name: "PostgreSQL", version: "16.4"}
+                        ],
+                        modules: [
+                            {name: "SupplyChain", version: "2.2.45"},
+                            {
+                                name: "Sell",
+                                parent: "SupplyChain",
+                                version: "2.1.19"
+                            }
+                        ],
+                        name: "Featherbone",
+                        version: "3.0.0"
+                    };
+                }
+                return server.handle(req);
+            });
+            globalThis.open = (url, name) => opened.push([url, name]);
+            vm.open();
+            await env.flush();
+            out = R.render(comps.dialog, {viewModel: vm});
+            text = R.text(out.tree);
+            vm.openApi();
+            globalThis.open = open;
+            env.respond(server.handle);
+
+            assert.ok(text.includes("3.0.0 (instance at 2.9.0)"), text);
+            assert.ok(text.includes("PostgreSQL"));
+            // Subordinate modules start out of sight, under their package
+            assert.ok(text.includes("SupplyChain"));
+            assert.equal(text.includes("Sell"), false);
+            assert.equal(
+                R.findAll(out.tree, R.byClass("fb-about-child")).length,
+                0
+            );
+            R.find(out.tree, R.byClass("fb-about-parent")).attrs.onclick();
+            out = R.render(comps.dialog, {viewModel: vm});
+            assert.ok(R.text(out.tree).includes("Sell"));
+            assert.equal(
+                R.findAll(out.tree, R.byClass("fb-about-child")).length,
+                1
+            );
+            R.find(out.tree, R.byClass("fb-about-parent")).attrs.onclick();
+            out = R.render(comps.dialog, {viewModel: vm});
+            assert.equal(R.text(out.tree).includes("Sell"), false);
+            R.find(out.tree, R.byClass("fb-about-parent")).attrs.onclick();
+            out = R.render(comps.dialog, {viewModel: vm});
+            assert.deepEqual(
+                buttons(out.tree).map((b) => b.text),
+                ["SupplyChain 1", "REST API", "C lose"]
+            );
+            assert.deepEqual(opened, [["/demo/api", "featherbone-api"]]);
         });
     });
 

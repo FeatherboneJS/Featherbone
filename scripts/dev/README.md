@@ -60,11 +60,39 @@ What comes out, by ship month:
 
 ```
 2026   J   F   M   A   M   J   J   A   S   O   N   D
-units  51 110 120 141 127 160 135  88 124 113  55  53
+units  51 110 111 150 127 159 136  88 123 114  55  53
 2027   J   F   M   A   M  | open book: Jun 137 lines, Jul 80,
-units  62 118 129 154 139 |            Aug 42, Sep 30, Oct 13
-YoY  +22  +7  +8  +9  +9  |
+units  62 113 133 155 139 |            Aug 42, Sep 30, Oct 13
+YoY  +22  +3 +20  +3  +9  |
 ```
+
+Late shipments (below) slide a few units across month ends, which is why the
+year-on-year is less even than the 8% the months were built at.
+
+### On-time delivery
+
+Not everything is on time. Each document keeps its promised date and the actual
+lands later on some of them. A month's late share rises with that month's sales
+volume, and the shares are set so the first five months of 2027 come to:
+
+| | On time, 2027-01 .. 2027-05 | Same months, 2026 | Rule |
+| --- | --- | --- | --- |
+| Shipments | 93.0% | 93.5% | `ship_date <= sales_order.promise_date` |
+| Work orders | 92.0% | 92.2% | `receipt_date <= work_order.due_date` |
+| Purchase receipts | 84.9% | 87.0% | `receipt_date <= purchase_order.planned_delivery` |
+
+* **Shipments** are one to about eight business days late; 64 of 955 are.
+* **Work orders follow the shipments.** Behind every late shipment one order in the
+  group (the top or a component) finishes late, and every order above it slips by the
+  same days. A few more are late but caught up in slack and the shipment still goes:
+  those are one day late, or up to three for the replenished 2-GALLEY-ASSY.
+* **Purchase receipts** are late independently, but never past the day the stock is
+  first needed, so a late receipt never starves a work order.
+* The quietest months (November to January) have too few orders to be late at the
+  rate; some of them are 100%.
+
+The late months are chosen by quota with a fixed seed, so the same file always
+produces the same figures. Nothing is late past the as-of date.
 
 ### Moving it
 
@@ -166,10 +194,13 @@ feathers that hold master data rather than configuration (`Contact`, `Address`,
 
 Two consequences worth knowing before the first run:
 
-* Units of measure, item categories, item groups, terms, ship methods and the
-  site record belong to packages (`Stock`, `Common`), not to `Core`, so they are
-  cleared. `teardrop-campers.sql` recreates them. If you want them to survive a
-  clear on their own, name them: `--keep Terms,ShipMethod,Site`.
+* Units of measure, item categories, item groups, terms, ship methods, the
+  site record and the sales regions (`SalesRegion`, `SalesRegionState`) belong to
+  packages (`Stock`, `Common`, `Sell`), not to `Core`, so they are cleared.
+  `teardrop-campers.sql` recreates them. If you want them to survive a clear on
+  their own, name them: `--keep Terms,ShipMethod,Site,SalesRegion,SalesRegionState`.
+  Regions are the four US census regions over all fifty states and DC; if a
+  database has the demo data but lost them, `sales-regions.sql` puts them back.
 * A table that holds rows but belongs to no installed feather stops the run
   rather than being silently left behind. `--clear-orphans` clears those too.
 

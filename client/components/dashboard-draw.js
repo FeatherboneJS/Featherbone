@@ -120,6 +120,10 @@ function dashNiceMax(value) {
         narrowed to show detail -- pass false and the measure is drawn as a
         symbol marker instead, whose changed form is itself the warning that
         the scale does not start at zero.
+    @param {Boolean} [opts.reverse] Less is better: darkest band on the
+        right instead of the left.
+    @param {Number} [opts.pending] Expected but not yet landed (open
+        orders), drawn as a paler extension of the bar.
     @param {String} [opts.title] Hover text.
     @return {Object} Mithril vnode
 */
@@ -135,13 +139,18 @@ function dashBullet(opts) {
     let previous = 0;
     let bands = ranges.concat(1);
 
-    // Qualitative bands, worst (darkest) first, lightening rightwards.
+    // Worst (darkest) band first; reversed where less is better.
     bands.forEach(function (fraction, index) {
         let from = dashScale(previous, 1, width);
         let to = dashScale(fraction, 1, width);
+        let shade = (
+            o.reverse
+            ? bands.length - index
+            : index + 1
+        );
 
         parts.push(m("rect", {
-            class: "fb-dash-band fb-dash-band-" + (index + 1),
+            class: "fb-dash-band fb-dash-band-" + shade,
             x: from,
             y: 0,
             width: Math.max(0, to - from),
@@ -159,11 +168,26 @@ function dashBullet(opts) {
             r: Math.max(3, barHeight / 2)
         }));
     } else {
+        let solid = dashScale(o.value, o.max, width);
+        let more = Number(o.pending);
+
+        if (Number.isFinite(more) && more > 0) {
+            parts.push(m("rect", {
+                class: "fb-dash-bullet-pending",
+                x: solid,
+                y: (height - barHeight) / 2,
+                width: Math.max(
+                    0,
+                    dashScale(Number(o.value) + more, o.max, width) - solid
+                ),
+                height: barHeight
+            }));
+        }
         parts.push(m("rect", {
             class: "fb-dash-bullet-value",
             x: 0,
             y: (height - barHeight) / 2,
-            width: dashScale(o.value, o.max, width),
+            width: solid,
             height: barHeight
         }));
     }
@@ -178,6 +202,31 @@ function dashBullet(opts) {
             x2: at,
             y1: (height - markHeight) / 2,
             y2: (height + markHeight) / 2
+        }));
+    }
+
+    /*
+        The target, if there is one. This is the mark the bullet graph
+        was designed around, and it is a different question from the
+        comparison: where we should be, rather than where we were. A
+        tile may carry both, so they cannot look alike -- the comparison
+        is a short bar across the measure, the target a full-height line
+        the whole way down, which also reads as a threshold rather than
+        as another data point.
+
+        Drawn last so it sits over everything else: a target hidden
+        behind the bar that passed it is the one case where the mark
+        matters most.
+    */
+    if (o.target !== undefined && o.target !== null) {
+        let aim = dashScale(o.target, o.max, width);
+
+        parts.push(m("line", {
+            class: "fb-dash-bullet-target",
+            x1: aim,
+            x2: aim,
+            y1: 0,
+            y2: height
         }));
     }
 
@@ -208,6 +257,8 @@ function dashBullet(opts) {
     @param {Object} [opts.band] {from, to} acceptable range, drawn behind.
     @param {Boolean} [opts.showDot] Defaults true. Marks the final value,
         tying the line's end to the number printed beside it.
+    @param {Number} [opts.low] Shared scale bottom, for small multiples.
+    @param {Number} [opts.high] Shared scale top, for small multiples.
     @return {Object} Mithril vnode
 */
 function dashSparkline(opts) {
@@ -236,8 +287,16 @@ function dashSparkline(opts) {
         }, []);
     }
 
-    low = Math.min.apply(null, points);
-    high = Math.max.apply(null, points);
+    low = (
+        Number.isFinite(o.low)
+        ? o.low
+        : Math.min.apply(null, points)
+    );
+    high = (
+        Number.isFinite(o.high)
+        ? o.high
+        : Math.max.apply(null, points)
+    );
     span = high - low;
     if (span === 0) {
         // A genuinely flat series: draw it down the middle rather than
@@ -401,10 +460,208 @@ function dashAxis(opts) {
     }, parts);
 }
 
+/**
+    Alert dot. One shape, urgency by intensity (Few). Level 0 draws
+    nothing but keeps the column aligned.
+
+    @param {Object} opts
+    @param {Number} opts.level 0 none, 1 worth a look, 2 urgent.
+    @param {String} [opts.title] Hover text.
+    @return {Object} Mithril vnode
+*/
+function dashAlert(opts) {
+    let o = opts || {};
+    let size = o.size || 10;
+    let parts = [];
+
+    if (o.level > 0) {
+        parts.push(m("circle", {
+            class: "fb-dash-alert-dot fb-dash-alert-" + Math.min(2, o.level),
+            cx: size / 2,
+            cy: size / 2,
+            r: size / 2 - 1
+        }));
+        if (o.title) {
+            parts.push(m("title", o.title));
+        }
+    }
+
+    return m("svg", {
+        class: "fb-dash-alert",
+        viewBox: "0 0 " + size + " " + size,
+        width: size,
+        height: size,
+        role: (
+            o.level > 0
+            ? "img"
+            : "presentation"
+        )
+    }, parts);
+}
+
+/**
+    Columns over time buckets, one per series side by side in each bucket,
+    on one zero-based scale with the axis stated once at the left. Late
+    buckets are drawn in the alert hue at the series' own intensity, and a
+    line marks the reporting date between the last late bucket and the
+    first that is not.
+
+    @param {Object} opts
+    @param {Array} opts.buckets [{label, name, late, values}], oldest first
+    @param {Array} opts.names Series names, for hover text.
+    @param {Number} opts.width
+    @param {Number} opts.height
+    @param {Function} [opts.format] Axis labels.
+    @param {Function} [opts.titleFormat] Hover values.
+    @param {String} [opts.asOfLabel] Said beside the line.
+    @param {Function} [opts.barAttrs] (bucket, seriesIndex) -> attributes
+    to add to that bar (a class, an onclick), or nothing.
+    @return {Object} Mithril vnode
+*/
+function dashColumns(opts) {
+    let o = opts || {};
+    let width = Math.max(60, o.width || 300);
+    let height = Math.max(50, o.height || 120);
+    let buckets = o.buckets || [];
+    let names = o.names || [];
+    let format = o.format || String;
+    let said = o.titleFormat || format;
+    let left = 44;
+    let top = 14;
+    let bottom = 14;
+    let plotW = width - left - 4;
+    let plotH = height - top - bottom;
+    let count = Math.max(1, buckets.length);
+    let step = plotW / count;
+    let gap = Math.max(1, step * 0.2);
+    let series = Math.max(1, names.length);
+    let barW = (step - gap) / series;
+    let high = 0;
+    let parts = [];
+    let now = buckets.findIndex(function (one) {
+        return !one.late;
+    });
+    let every = Math.max(1, Math.ceil(40 / step));
+    let max;
+
+    buckets.forEach(function (one) {
+        one.values.forEach(function (n) {
+            if (n > high) {
+                high = n;
+            }
+        });
+    });
+    max = dashNiceMax(high);
+
+    [0, 0.5, 1].forEach(function (fraction) {
+        parts.push(m("text", {
+            class: "fb-dash-axis-text",
+            x: left - 4,
+            y: top + plotH - fraction * plotH + 3,
+            "text-anchor": "end"
+        }, format(max * fraction)));
+    });
+    parts.push(m("line", {
+        class: "fb-dash-axis-line",
+        x1: left,
+        x2: left + plotW,
+        y1: top + plotH + 0.5,
+        y2: top + plotH + 0.5
+    }));
+
+    buckets.forEach(function (one, index) {
+        let x = left + index * step + gap / 2;
+
+        one.values.forEach(function (n, which) {
+            let h = dashScale(n, max, plotH);
+
+            if (h <= 0) {
+                return;
+            }
+            let extra = (
+                o.barAttrs
+                ? o.barAttrs(one, which)
+                : null
+            ) || {};
+            let kind = (
+                one.late
+                ? "fb-dash-hist-late fb-dash-hist-s" + which
+                : "fb-dash-hist-bar fb-dash-hist-s" + which
+            );
+
+            parts.push(m("rect", Object.assign({}, extra, {
+                class: (
+                    extra.class
+                    ? kind + " " + extra.class
+                    : kind
+                ),
+                x: x + which * barW,
+                y: top + plotH - h,
+                width: Math.max(1, barW - (
+                    series > 1
+                    ? 1
+                    : 0
+                )),
+                height: h
+            }), m("title", (
+                (
+                    names[which]
+                    ? names[which] + ", "
+                    : ""
+                ) +
+                (one.name || one.label) + ": " + said(n) +
+                (
+                    one.late
+                    ? ", past due"
+                    : ""
+                )
+            ))));
+        });
+        if (one.label && index % every === 0) {
+            parts.push(m("text", {
+                class: "fb-dash-axis-text",
+                x: left + index * step + step / 2,
+                y: height - 2,
+                "text-anchor": "middle"
+            }, one.label));
+        }
+    });
+
+    if (now > 0) {
+        let at = left + now * step;
+
+        parts.push(m("line", {
+            class: "fb-dash-hist-now",
+            x1: at,
+            x2: at,
+            y1: top - 4,
+            y2: top + plotH
+        }));
+        if (o.asOfLabel) {
+            parts.push(m("text", {
+                class: "fb-dash-axis-text fb-dash-hist-now-text",
+                x: at + 3,
+                y: top - 4,
+                "text-anchor": "start"
+            }, o.asOfLabel));
+        }
+    }
+
+    return m("svg", {
+        class: "fb-dash-columns",
+        viewBox: "0 0 " + width + " " + height,
+        width,
+        height,
+        role: "img"
+    }, parts);
+}
+
 f.catalog().register("global", "dashboardDraw", {
+    alert: dashAlert,
     axis: dashAxis,
     bar: dashBar,
     bullet: dashBullet,
+    columns: dashColumns,
     niceMax: dashNiceMax,
     scale: dashScale,
     sparkline: dashSparkline

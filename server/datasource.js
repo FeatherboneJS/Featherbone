@@ -33,6 +33,9 @@
     const {CRUD} = require("./services/crud");
     const {Currency} = require("./services/currency");
     const {Feathers} = require("./services/feathers");
+    const {Help} = require("./services/help");
+    const {About} = require("./services/about");
+    const {OpenApi} = require("./services/openapi");
     const {Importer, Exporter} = require("./services/io");
     const {Installer} = require("./services/installer");
     const {
@@ -46,6 +49,7 @@
     const {Packages} = require("./services/packages");
     const {Settings} = require("./services/settings");
     const {Role} = require("./services/role");
+    const {Dashboards} = require("./services/dashboards");
     const {Tools} = require("./services/tools");
     const {Workbooks} = require("./services/workbooks");
     const {Config} = require("./config");
@@ -60,8 +64,12 @@
     const config = new Config();
     const crud = new CRUD();
     const currency = new Currency();
+    const dashboards = new Dashboards();
     const exporter = new Exporter();
     const feathers = new Feathers();
+    const help = new Help();
+    const about = new About();
+    const openApi = new OpenApi();
     const importer = new Importer();
     const installer = new Installer();
     const manager = new Manager();
@@ -78,6 +86,27 @@
     const mail = new Mail();
     const packages = new Packages();
     const tenants = [];
+
+    /*
+        The data type formats the server knows, hung on `f` so that a
+        module's code can add its own: SupplyChain's Common module
+        registers unitCost, salesPrice and purchasePrice this way, and
+        `feathers.js` builds a column from the format a property
+        declares.
+
+        It belongs here rather than in server.js because this is what
+        loads and runs module code, and install.js loads it too. When
+        only server.js set it, `f.formats` was undefined in every
+        install run from the command line, so SupplyChain's own money
+        formats were never registered and `feathers.js`, finding no
+        format by that name, fell back to the property's type and made
+        the column `json` instead of `mono` (improvement item 0.11).
+        The same install through the running server was correct, which
+        is exactly how the defect was first described.
+    */
+    if (!f.formats) {
+        f.formats = tools.formats;
+    }
 
     /**
         Server datasource class.
@@ -247,7 +276,6 @@
         let onDisk = {};
         let sources;
         let run = [];
-        let fromDisk = {};
 
         Object.keys(baseRegistry).forEach(function (method) {
             Object.assign(reg[method], baseRegistry[method]);
@@ -352,42 +380,22 @@
         );
 
         /*
-            Database rows load in module dependency order. A module the
-            server holds on disk loads from its package files instead,
-            in the same position, so load order matches what a plain
-            database install produces.
+            Order comes from the module list, never from which modules
+            happen to have rows: a module on disk has none, and ordering
+            by rows put it last instead of where its dependencies say.
         */
-        sources.forEach(function (src) {
-            let version = onDisk[src.module];
+        let order = (
+            hasModules.rows[0].found
+            ? await services.getModuleOrder({client})
+            : []
+        );
 
-            if (version !== undefined) {
-                if (!fromDisk[src.module]) {
-                    fromDisk[src.module] = true;
-                    packages.serviceSources(
-                        src.module,
-                        version
-                    ).forEach(function (dsrc) {
-                        run.push(dsrc);
-                    });
-                }
-                return;
-            }
-
-            run.push(src);
-        });
-
-        // A disk module with no service rows in the database still
-        // loads -- Deploy wrote its schema but its code lives here
-        Object.keys(onDisk).forEach(function (name) {
-            if (!fromDisk[name]) {
-                packages.serviceSources(
-                    name,
-                    onDisk[name]
-                ).forEach(function (dsrc) {
-                    run.push(dsrc);
-                });
-            }
-        });
+        run = that.serviceLoadOrder(
+            order,
+            onDisk,
+            sources,
+            packages.serviceSources
+        );
 
         loadTarget = reg;
         dbBuilding[client.database] = reg;
@@ -689,6 +697,54 @@
             );
         }
     }
+
+    /**
+        The service scripts a database runs, in the order it runs them:
+        each module in dependency order, taking its code from the
+        package on disk when the server holds one and from its rows
+        when it does not.
+
+        Order comes from `order` alone, so it does not matter which
+        modules have rows -- a module on disk has none.
+
+        Separate from
+        {{#crossLink "Datasource/buildRegistry:method"}}{{/crossLink}}
+        so the decision can be tested without a database or a packages
+        directory (ADR-002).
+
+        @method serviceLoadOrder
+        @param {Array} order Module names in dependency order
+        @param {Object} onDisk Versions the server holds, by module
+        @param {Array} rows Service rows, in any order
+        @param {Function} fromDisk (name, version) to a module's
+        package sources
+        @return {Array} Sources in load order
+    */
+    that.serviceLoadOrder = function (order, onDisk, rows, fromDisk) {
+        let rowsFor = {};
+        let run = [];
+
+        rows.forEach(function (src) {
+            if (rowsFor[src.module] === undefined) {
+                rowsFor[src.module] = [];
+            }
+            rowsFor[src.module].push(src);
+        });
+
+        order.forEach(function (name) {
+            let version = onDisk[name];
+            let own = rowsFor[name] || [];
+
+            if (version !== undefined) {
+                fromDisk(name, version).forEach((src) => run.push(src));
+                return;
+            }
+
+            own.forEach((src) => run.push(src));
+        });
+
+        return run;
+    };
 
     /**
         The registered instances that are no longer registered, given
@@ -2456,11 +2512,16 @@
                     (t) => t.pgDatabase === opts.databases[n]
                 );
                 if (!target) {
-                    throw (
+                    let refused = new Error(
                         "Invalid target database " +
                         opts.databases[n] +
                         " passed"
                     );
+
+                    // Refused before anything was opened, let alone
+                    // changed.
+                    refused.nothingCommitted = true;
+                    throw refused;
                 }
                 n += 1;
                 targets.push(target);
@@ -2472,95 +2533,147 @@
         resp = await db.connect(opts.tenant);
 
         /*
-            A trusted install acts as the service account, which is
-            what the command line has always done (install.js sets the
-            client's user to config's pgUser). The operator who asked
-            is recorded in the audit, not impersonated in the database:
-            a platform administrator deploying to a customer's instance
-            is generally not a user of it at all, and the row-level
-            ownership checks are written for users of the database.
+            Everything below runs through the connection just opened,
+            and it is given back at the end whatever happens. It used
+            to be given back only where the work finished: an install
+            that threw -- a package naming a feather nothing defines,
+            say -- left the client checked out of the instance's pool
+            for the life of the process. Eight failed deploys emptied a
+            ten-connection pool, and the next request that needed one
+            waited for it for ever, so the instance was finished until
+            the server restarted. Found 2026-10-24 by a suite that
+            deploys a package built to fail (`api/deploy-failure`), as
+            a hang in a later file.
         */
-        if (opts.isSuper === true) {
-            let conf = await config.read();
+        async function work() {
 
-            resp.client.currentUser = () => conf.pgUser;
+            /*
+                A trusted install acts as the service account, which is
+                what the command line has always done (install.js sets the
+                client's user to config's pgUser). The operator who asked
+                is recorded in the audit, not impersonated in the database:
+                a platform administrator deploying to a customer's instance
+                is generally not a user of it at all, and the row-level
+                ownership checks are written for users of the database.
+            */
+            if (opts.isSuper === true) {
+                let conf = await config.read();
+
+                resp.client.currentUser = () => conf.pgUser;
+            }
+
+            /*
+                Code is never stored in the database. What a module runs
+                is read from its package's files (ADR-002), so a directory
+                that carries services or a client script has to be a
+                package this server holds -- Core, or one put under the
+                modules directory -- or there would be nowhere for the
+                code to be served from. Refused here, before anything is
+                changed, rather than installing a module with no code.
+            */
+            let said;
+
+            await ensurePackagesScanned();
+
+            try {
+                said = JSON.parse(await fs.promises.readFile(
+                    path.join(filename, "manifest.json"),
+                    "utf8"
+                ));
+            } catch (ignore) {
+                // No readable manifest: the installer will say so
+                said = {};
+            }
+
+            let held = packages.resolve(said.module, said.version);
+            let listed = said.files || [];
+            let carriesCode = listed.some(
+                (file) => file.type === "service" || file.type === "module"
+            );
+
+            if (carriesCode && !(held && (
+                path.resolve(held.dir) === path.resolve(filename)
+            ))) {
+                let refused = new Error(
+                    "\"" + said.module + " " + said.version + "\" in " +
+                    filename + " is not a package this server holds, " +
+                    "and code is never stored in the database. Install " +
+                    "it as a package first, then deploy it."
+                );
+
+                refused.nothingCommitted = true;
+                return Promise.reject(refused);
+            }
+
+            // Do the work
+            while (targets.length) {
+                /*
+                    An install aimed at several databases commits each
+                    as it goes, so a failure on the second has already
+                    changed the first. Only a failure on the first can
+                    honestly say nothing was committed.
+                */
+                if (done > 0) {
+                    multiTarget = true;
+                }
+                await installer.install(
+                    that,
+                    resp.client,
+                    filename,
+                    username,
+                    {
+                        /*
+                            "Super" here means a caller the installer need
+                            not re-check: it skips the per-database super
+                            user lookup, which is what the command line has
+                            always passed. A Deploy has already required a
+                            platform administrator, and the database it is
+                            aimed at is not one the caller has to be a user
+                            of, so it passes it too. It used to also skip
+                            the ServerProcess progress record, on the
+                            reasoning that nothing was watching -- true for
+                            the command line, false for a platform admin
+                            watching Upgrade or Deploy from the screen, so
+                            that part now turns on progress tracking rather
+                            than off it whenever the caller hands over a
+                            processId to track it by (John, 2026-10-18: "I
+                            get no idea of whether it's working or not").
+                        */
+                        isSuper: opts.isSuper === true,
+                        processId: opts.processId,
+                        subscription: opts.subscription,
+                        tenant: targets.shift()
+                    }
+                );
+                done += 1;
+            }
+            return filename;
         }
 
-        /*
-            Code is never stored in the database. What a module runs
-            is read from its package's files (ADR-002), so a directory
-            that carries services or a client script has to be a
-            package this server holds -- Core, or one put under the
-            modules directory -- or there would be nowhere for the
-            code to be served from. Refused here, before anything is
-            changed, rather than installing a module with no code.
-        */
-        let said;
+        let done = 0;
+        let multiTarget = false;
 
-        await ensurePackagesScanned();
+        let installed;
+        let failed;
 
         try {
-            said = JSON.parse(await fs.promises.readFile(
-                path.join(filename, "manifest.json"),
-                "utf8"
-            ));
-        } catch (ignore) {
-            // No readable manifest: the installer will say so
-            said = {};
+            installed = await work();
+        } catch (err) {
+            failed = err;
         }
 
-        let held = packages.resolve(said.module, said.version);
-        let listed = said.files || [];
-        let carriesCode = listed.some(
-            (file) => file.type === "service" || file.type === "module"
-        );
-
-        if (carriesCode && !(held && (
-            path.resolve(held.dir) === path.resolve(filename)
-        ))) {
-            resp.done();
-            return Promise.reject(new Error(
-                "\"" + said.module + " " + said.version + "\" in " +
-                filename + " is not a package this server holds, " +
-                "and code is never stored in the database. Install " +
-                "it as a package first, then deploy it."
-            ));
-        }
-
-        // Do the work
-        while (targets.length) {
-            await installer.install(
-                that,
-                resp.client,
-                filename,
-                username,
-                {
-                    /*
-                        "Super" here means a caller the installer need
-                        not re-check: it skips the per-database super
-                        user lookup, which is what the command line has
-                        always passed. A Deploy has already required a
-                        platform administrator, and the database it is
-                        aimed at is not one the caller has to be a user
-                        of, so it passes it too. It used to also skip
-                        the ServerProcess progress record, on the
-                        reasoning that nothing was watching -- true for
-                        the command line, false for a platform admin
-                        watching Upgrade or Deploy from the screen, so
-                        that part now turns on progress tracking rather
-                        than off it whenever the caller hands over a
-                        processId to track it by (John, 2026-10-18: "I
-                        get no idea of whether it's working or not").
-                    */
-                    isSuper: opts.isSuper === true,
-                    processId: opts.processId,
-                    subscription: opts.subscription,
-                    tenant: targets.shift()
-                }
-            );
-        }
         resp.done();
-        return filename;
+        if (failed !== undefined) {
+            if (
+                multiTarget &&
+                failed &&
+                typeof failed === "object"
+            ) {
+                failed.nothingCommitted = false;
+            }
+            throw failed;
+        }
+        return installed;
     };
 
     /**
@@ -2607,9 +2720,13 @@
         @param {String} name Module name
         @param {String} username User name
         @param {Object} [tenant] Tenant
+        @param {Object} [options]
+        @param {Boolean} [options.includeDashboard] Bundle the dashboard
+        layouts this module owns and its wallpaper image, if any.
+        Defaults true.
         @return {Promise}
     */
-    that.package = function (name, username, tenant) {
+    that.package = function (name, username, tenant, options) {
         return new Promise(function (resolve, reject) {
             // Do the work
             function doPackage(resp) {
@@ -2622,7 +2739,8 @@
                     packager.package(
                         resp.client,
                         name,
-                        username
+                        username,
+                        options
                     ).then(
                         callback
                     ).catch(
@@ -3540,6 +3658,35 @@
             }
 
             resp = await crud.doSelect(payload, false, isSuperUser);
+
+            /*
+                An id that is here but deleted. Deleting a record does
+                not free its id -- the unique index on id covers deleted
+                rows too -- so inserting would fail on a duplicate key,
+                which is what a package deploy used to die on whenever
+                somebody had deleted one of the records it carries
+                (John, Oct 2026: the same deploy failure "for the
+                umpteenth time"). A POST that names an id is asserting
+                that record, so it comes back and the write lands on it.
+            */
+            if (!resp) {
+                let gone = await crud.doSelect({
+                    client: theClient,
+                    id: obj.id,
+                    name: obj.name,
+                    showDeleted: true
+                }, false, isSuperUser);
+
+                if (gone) {
+                    await theClient.query(
+                        "UPDATE object SET is_deleted = false, " +
+                        "  updated = now(), updated_by = $2 WHERE id = $1",
+                        [obj.id, theClient.currentUser()]
+                    );
+                    resp = await crud.doSelect(payload, false, isSuperUser);
+                }
+            }
+
             if (resp) {
                 obj.name = resp.objectType;
                 obj.oldRec = Object.freeze(f.copy(resp));
@@ -3678,6 +3825,7 @@
                             let err = new Error(
                                 "Record " + obj.id + " not found."
                             );
+                            err.statusCode = 404;
                             await rollback(err);
                             throw err;
                         }
@@ -4359,6 +4507,10 @@
     that.registerFunction("GET", "convertCurrency", currency.convertCurrency);
     that.registerFunction("GET", "getServices", services.getServices);
     that.registerFunction("GET", "getFeather", feathers.getFeather);
+    that.registerFunction("GET", "getHelpFile", help.getFile);
+    that.registerFunction("GET", "getHelpTopic", help.getTopic);
+    that.registerFunction("GET", "getAbout", about.getAbout);
+    that.registerFunction("GET", "getOpenApi", openApi.getSpec);
     that.registerFunction("GET", "getProfile", profile.getProfile);
     that.registerFunction("GET", "getRoutes", routes.getRoutes);
     that.registerFunction("GET", "getRouteFunction", getRouteFunction);
@@ -4373,6 +4525,13 @@
         "GET",
         "getSettingsDefinition",
         settings.getSettingsDefinition
+    );
+    that.registerFunction("GET", "getDashboard", dashboards.getDashboard);
+    that.registerFunction("GET", "getDashboards", dashboards.getDashboards);
+    that.registerFunction(
+        "GET",
+        "getDashboardTargets",
+        dashboards.getDashboardTargets
     );
     that.registerFunction("GET", "getWorkbook", workbooks.getWorkbook);
     that.registerFunction("GET", "getWorkbooks", workbooks.getWorkbooks);
@@ -4419,6 +4578,12 @@
     that.registerFunction("PUT", "saveFeather", feathers.saveFeather);
     that.registerFunction("PUT", "saveProfile", profile.saveProfile);
     that.registerFunction("PUT", "saveSettings", settings.saveSettings);
+    that.registerFunction("PUT", "saveDashboard", dashboards.saveDashboard);
+    that.registerFunction(
+        "PUT",
+        "saveDashboardTarget",
+        dashboards.saveDashboardTarget
+    );
     that.registerFunction("PUT", "saveWorkbook", workbooks.saveWorkbook);
     that.registerFunction(
         "PUT",
@@ -4427,6 +4592,16 @@
     );
     that.registerFunction("DELETE", "deleteFeather", feathers.deleteFeather);
     that.registerFunction("DELETE", "deleteModule", installer.deleteModule);
+    that.registerFunction(
+        "DELETE",
+        "deleteDashboard",
+        dashboards.deleteDashboard
+    );
+    that.registerFunction(
+        "DELETE",
+        "deleteDashboardTarget",
+        dashboards.deleteDashboardTarget
+    );
     that.registerFunction("DELETE", "deleteWorkbook", workbooks.deleteWorkbook);
 
     /*

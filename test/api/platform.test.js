@@ -22,6 +22,7 @@ const assert = require("node:assert/strict");
 const db = require("../harness/db");
 const settings = require("../harness/env");
 const {Session} = require("../harness/http");
+const {flags} = require("../harness/authority");
 
 const ROOT = settings.baseUrl.replace("/" + settings.testDb, "");
 const PLATFORM = "fbt_platform_admin";
@@ -30,21 +31,6 @@ const NEW_ORG = "FBHerbal";
 const NEW_ADMIN = "fbt_herbal_admin";
 const NEW_PW = "Fbtest-Herbal-4!";
 
-function flags(username, data) {
-    return db.withClient(settings.managerDb, (client) => client.query(
-        (
-            "UPDATE identity SET is_org_admin = $2, " +
-            "  is_platform_admin = $3, updated = now(), " +
-            "  updated_by = 'fbtest' " +
-            "WHERE lower(username) = lower($1)"
-        ),
-        [
-            username,
-            data.isOrgAdmin === true,
-            data.isPlatformAdmin === true
-        ]
-    ));
-}
 
 async function dropOrganization(name) {
     await db.withClient(settings.managerDb, async function (client) {
@@ -134,11 +120,23 @@ describe("the platform console (G.2, G.3)", function () {
 
         assert.ok(names.includes(PLATFORM), "a person who can sign in");
         assert.ok(names.includes(ORG_ADMIN), "from another account too");
+        /*
+            The server orders by lower(username) in the database's
+            collation, which is not JavaScript's: en_US ignores the
+            underscore, so fbtest_admin sorts before fbt_forgot there
+            and after it in a C-collated cluster. Ask the database.
+        */
+        let ordered = await db.withClient(
+            settings.managerDb,
+            (client) => client.query(
+                "SELECT n FROM unnest($1::text[]) AS n ORDER BY lower(n)",
+                [names]
+            )
+        );
+
         assert.deepEqual(
             names,
-            names.slice().sort(
-                (a, b) => a.toLowerCase().localeCompare(b.toLowerCase())
-            ),
+            ordered.rows.map((row) => row.n),
             "in name order"
         );
         assert.ok(

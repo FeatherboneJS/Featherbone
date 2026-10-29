@@ -23,7 +23,14 @@
     "use strict";
 
     const AdmZip = require("adm-zip");
+    const fs = require("fs");
     const path = require("path");
+    const {
+        Config
+    } = require("../config");
+    const {
+        Packages
+    } = require("./packages");
     const {
         Tools
     } = require("./tools");
@@ -61,6 +68,51 @@
     ];
 
     const tools = new Tools();
+    const config = new Config();
+    const packages = new Packages();
+
+    /*
+        Code comes out of a package the same way it goes in: from the
+        files on disk, at the version this database deployed (ADR-002
+        section 2). Reading the rows instead was how an export of a
+        deployed module came out wrong -- a deployment writes no code to
+        rows, so `module.script` was empty and the zip carried an empty
+        module.js, while the `data_service` rows it did find were
+        pre-ADR-002 copies the runtime had long since stopped loading.
+
+        A module the server holds no package for still answers from its
+        rows, which is where a module that has never been repackaged
+        lives.
+    */
+    function diskSources(mod) {
+        let src;
+
+        if (
+            !mod || !mod.name || !mod.version ||
+            !packages.resolve(mod.name, mod.version)
+        ) {
+            return undefined;
+        }
+
+        src = packages.clientSource(mod.name, mod.version);
+
+        return {
+            script: (
+                src === undefined
+                ? undefined
+                : src.script
+            ),
+            services: packages.serviceSources(mod.name, mod.version)
+        };
+    }
+
+    // Packaging is rare and user-initiated, and a package may have been
+    // installed since this process started, so the scan is not cached.
+    function scanPackages() {
+        return config.read().then(function (conf) {
+            packages.scan(conf.modulesDir);
+        });
+    }
 
     function getSortedModules(client, name) {
         return new Promise(function (resolve, reject) {
@@ -156,8 +208,9 @@
         });
     }
 
-    function addModule(manifest, zip, resp, folder) {
+    function addModule(manifest, zip, resp, folder, disk) {
         let content;
+        let script;
         let filename = folder + "module.js";
 
         content = resp.slice().pop();
@@ -178,9 +231,16 @@
             path: "module.js"
         });
 
+        script = (
+            (disk && disk.script !== undefined)
+            ? disk.script
+            : content.script
+        );
+        script = script || "";
+
         zip.addFile(
             filename,
-            Buffer.alloc(content.script.length, content.script)
+            Buffer.alloc(script.length, script)
         );
     }
 
@@ -444,8 +504,12 @@
         }
     }
 
-    function addServices(manifest, zip, resp, folder) {
-        let content = resp.rows;
+    function addServices(manifest, zip, resp, folder, disk) {
+        let content = (
+            disk === undefined
+            ? resp.rows
+            : disk.services
+        );
 
         if (content.length) {
             content.forEach(function (service) {
@@ -517,6 +581,125 @@
                 Buffer.alloc(content.length, content)
             );
         }
+    }
+
+    /*
+        The dashboard layouts this module owns. A layout is one JSON
+        document keyed on a name -- no ids, so it cannot be broken by
+        ids differing between databases, and a module that ships one
+        arrives with a board rather than with a board to assemble.
+
+        The `isDefault` flag travels with it. Installing a module that
+        claims the default moves everybody who has not chosen a layout
+        of their own onto it, which is the point: a package's board is
+        no use if every user has to go and find it. Anyone who HAS
+        chosen keeps their choice, because that lives in their profile
+        and nothing here touches it.
+    */
+    function addDashboards(manifest, zip, resp, folder, owner) {
+        let content = tools.sanitize(resp.rows).map(function (layout) {
+            // A layout saved from the Home tab has no module of its own
+            // (see the query); once packaged it belongs to this one.
+            return Object.assign({}, layout, {
+                module: layout.module || owner
+            });
+        });
+        let name = "dashboards.json";
+        let filename = folder + name;
+
+        if (content.length) {
+            content = JSON.stringify(content, null, 4);
+
+            manifest.files.push({
+                type: "dashboard",
+                path: name
+            });
+
+            zip.addFile(
+                filename,
+                Buffer.alloc(content.length, content)
+            );
+        }
+    }
+
+    /*
+        The app title currently in use (brandingSettings, set by
+        whichever package's manifest last carried one -- see
+        installer.js's saveBranding). Carried as a manifest.title,
+        the same shape saveBranding reads back in on install -- never
+        a manifest.files entry, same as it never needs one coming in.
+
+        Unlike the wallpaper below, the title travels with every
+        export regardless of the dashboard checkbox: it names the
+        application, which is not "the dashboard board" the checkbox
+        describes, and a package re-exported with that box unchecked
+        should not silently go back to calling itself Featherbone.
+    */
+    function addTitle(manifest, resp) {
+        let row = resp.rows[0] || {};
+        let data = row.data || {};
+
+        if (data.title) {
+            manifest.title = data.title;
+        }
+    }
+
+    /*
+        One brandingSettings image, carried as a sibling "<stem>"
+        image file, the same shape saveBranding reads back in on
+        install. Shared by addWallpaper and addIcon below, which
+        differ only in which brandingSettings key they read and which
+        stem they write the sibling file under.
+
+        A value that is a pasted web address rather than a file this
+        server holds has nothing to add to the zip.
+    */
+    function addBrandAsset(zip, resp, folder, key, stem) {
+        // Work around linter dogma (as server.js does).
+        let existssync = "existsSync";
+        let readfilesync = "readFileSync";
+        let row = resp.rows[0] || {};
+        let data = row.data || {};
+        let value = data[key];
+        let uploadPath;
+        let ext;
+
+        if (value && !value.startsWith("http")) {
+            ext = path.extname(value).toLowerCase() || ".png";
+            uploadPath = path.join(
+                process.cwd(),
+                "files",
+                "upload",
+                value
+            );
+
+            if (fs[existssync](uploadPath)) {
+                zip.addFile(
+                    folder + stem + ext,
+                    fs[readfilesync](uploadPath)
+                );
+            }
+        }
+    }
+
+    /*
+        The dashboard wallpaper currently in use. Part of what the
+        dashboard checkbox means by "the dashboard board", so it
+        travels only when that is checked -- see addDashboards.
+    */
+    function addWallpaper(zip, resp, folder) {
+        addBrandAsset(zip, resp, folder, "dashboardImage", "dashboard");
+    }
+
+    /*
+        The ribbon/tab icon currently in use, in place of the
+        Featherbone quill. Like the title (addTitle above) rather than
+        the wallpaper: it names the application rather than being part
+        of "the dashboard board", so it travels with every export
+        regardless of the dashboard checkbox -- see the call site.
+    */
+    function addIcon(zip, resp, folder) {
+        addBrandAsset(zip, resp, folder, "icon", "icon");
     }
 
     function addWorkbooks(manifest, zip, resp, folder) {
@@ -602,7 +785,15 @@
         */
         let that = {};
 
-        function addDependencies(client, manifest, pzip, resp, user, folder) {
+        function addDependencies(
+            client,
+            manifest,
+            pzip,
+            resp,
+            user,
+            folder,
+            includeDashboard
+        ) {
             return new Promise(function (resolve, reject) {
                 let content;
                 let requests = [];
@@ -635,7 +826,9 @@
                             {
                                 zip: pzip,
                                 folder: folder + name.toSpinalCase() + "/",
-                                module: mod
+                                includeDashboard,
+                                module: mod,
+                                scanned: true
                             }
                         ).then(callback).catch(reject);
                     });
@@ -660,6 +853,18 @@
         that.package = function (client, name, user, sub) {
             sub = sub || {};
 
+            /*
+                Once per export, not once per submodule: the index is
+                read on the way in, and addDependencies passes `scanned`
+                when it recurses through here.
+            */
+            if (!sub.scanned) {
+                sub.scanned = true;
+                return scanPackages().then(
+                    () => that.package(client, name, user, sub)
+                );
+            }
+
             return new Promise(function (resolve, reject) {
                 let sql;
                 let params = [name];
@@ -672,6 +877,7 @@
                 };
                 let zip = sub.zip || new AdmZip();
                 let folder = sub.folder || "";
+                let includeDashboard = sub.includeDashboard !== false;
 
                 if (folder) {
                     // Create folder for sub module
@@ -793,6 +999,31 @@
                 );
                 requests.push(client.query(sql, params));
 
+                // Dashboard layouts. Save Layout never records a module,
+                // so a layout somebody built on the Home tab has a blank
+                // one and would belong to no export at all. The module
+                // being exported (not a dependency packaged beneath it)
+                // therefore takes the unowned layouts too -- see
+                // addDashboards, which stamps them with its name.
+                sql = (
+                    "SELECT name, label, description, module, " +
+                    "sequence, is_default, config " +
+                    "FROM \"$dashboard\" WHERE " +
+                    "(module = $1 OR (module = '' AND $2::boolean)) " +
+                    "AND NOT is_deleted " +
+                    "ORDER BY sequence, name;"
+                );
+                requests.push(client.query(sql, [name, !sub.module]));
+
+                // App title and dashboard wallpaper currently in use --
+                // see addTitle and addWallpaper
+                sql = (
+                    "SELECT data FROM \"$settings\" " +
+                    "WHERE name = 'brandingSettings' " +
+                    "AND NOT is_deleted;"
+                );
+                requests.push(client.query(sql));
+
                 Promise.all(requests).then(function (resp) {
                     let filename = name;
                     let pathname = path.format({
@@ -801,9 +1032,22 @@
                     });
 
                     function finishPackage() {
+                        /*
+                            The module row this package is built from --
+                            the same one addModule writes to the
+                            manifest, read here because the services go
+                            in before it and need to know which version
+                            on disk to take their code from.
+                        */
+                        let modRow = (
+                            sub.module ||
+                            resp[0].slice().pop()
+                        );
+                        let disk = diskSources(modRow);
+
                         addFeathers(manifest, zip, resp[1], folder);
                         addRelWidgets(manifest, zip, resp[8], folder);
-                        addServices(manifest, zip, resp[3], folder);
+                        addServices(manifest, zip, resp[3], folder, disk);
                         addBatch("HelpLink", manifest, zip, resp[9], folder);
                         addForms(manifest, zip, resp[2], folder);
                         addBatch("Route", manifest, zip, resp[4], folder);
@@ -819,10 +1063,38 @@
                         );
                         addWorkbooks(manifest, zip, resp[7], folder);
 
+                        // Branding is instance-wide, not module-scoped
+                        // like everything else packaged here, so it
+                        // belongs on the manifest somebody is actually
+                        // choosing to export -- not restamped onto every
+                        // dependency's own manifest underneath it.
+                        if (!sub.module) {
+                            addTitle(manifest, resp[12]);
+                            addIcon(zip, resp[12], folder);
+                            if (includeDashboard) {
+                                addWallpaper(zip, resp[12], folder);
+                            }
+                        }
+                        if (includeDashboard) {
+                            addDashboards(
+                                manifest,
+                                zip,
+                                resp[11],
+                                folder,
+                                name
+                            );
+                        }
+
                         if (sub.module) {
-                            addModule(manifest, zip, [sub.module], folder);
+                            addModule(
+                                manifest,
+                                zip,
+                                [sub.module],
+                                folder,
+                                disk
+                            );
                         } else {
-                            addModule(manifest, zip, resp[0], folder);
+                            addModule(manifest, zip, resp[0], folder, disk);
                         }
 
                         if (manifest.version) {
@@ -857,7 +1129,8 @@
                             zip,
                             resp[0],
                             user,
-                            folder
+                            folder,
+                            includeDashboard
                         ).then(finishPackage).catch(reject);
                     }
                 }).catch(reject);

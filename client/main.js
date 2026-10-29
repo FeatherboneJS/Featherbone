@@ -16,7 +16,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 /*jslint this, browser, eval, devel, unordered*/
-/*global f, WebSocket, m*/
+/*global f, WebSocket, jsonpatch, m*/
 import model from "./models/model.js";
 import settings from "./models/settings.js";
 
@@ -26,6 +26,67 @@ const catalog = f.catalog();
 const components = catalog.store().components();
 const viewModels = catalog.store().viewModels();
 const connectionMonitor = catalog.store().global().connectionMonitor;
+
+/**
+    The browser tab's title, in place of "Featherbone" once a package's
+    manifest has carried a "title" (brandingSettings, set by
+    installer.js's saveBranding). Same lookup as ribbon.js's own
+    brandTitle -- kept local here rather than shared, since the two
+    files have no import relationship.
+
+    @method brandTitle
+    @return {String}
+*/
+function brandTitle() {
+    let models = catalog.store().models();
+    let theSettings = (
+        models.brandingSettings
+        ? models.brandingSettings()
+        : null
+    );
+    let title = (
+        (theSettings && theSettings.data && theSettings.data.title)
+        ? theSettings.data.title()
+        : ""
+    );
+
+    return title || "Featherbone";
+}
+
+/**
+    The browser tab's icon, in place of the Featherbone quill once a
+    package's manifest has carried a sibling "icon" image
+    (brandingSettings, set by installer.js's saveBranding). `""` when
+    none is set, so the caller can fall back to the default favicon.
+    Same lookup as ribbon.js's own brandIcon -- kept local here rather
+    than shared, since the two files have no import relationship.
+
+    @method brandIcon
+    @return {String}
+*/
+function brandIcon() {
+    let models = catalog.store().models();
+    let theSettings = (
+        models.brandingSettings
+        ? models.brandingSettings()
+        : null
+    );
+    let value = (
+        (theSettings && theSettings.data && theSettings.data.icon)
+        ? theSettings.data.icon()
+        : ""
+    );
+
+    if (!value) {
+        return "";
+    }
+
+    return (
+        value.startsWith("http")
+        ? value
+        : "/files/upload/" + value
+    );
+}
 
 /*
     A sign-in link from an email that no longer works (two days old, the
@@ -79,17 +140,463 @@ let addWbFromTemplateDlg;
 let deleteWbTemplateDlg;
 let navCategoryDlg;
 let navCategoryErrDlg;
+let asOfDlg;
+let saveLayoutDlg;
+let saveLayoutErrDlg;
+let addTileDlg;
+let addTileErrDlg;
+let targetsDlg;
+let targetsErrDlg;
+let deleteLayoutDlg;
+let deleteLayoutErrDlg;
 let acctMenu;
 let models = catalog.store().models();
 let initialized = false;
+let starting = Promise.resolve();
 let isAdmin = false;
 // Whether to open the screens that belong to whoever administers the
 // organization: Settings, Users, Instances (see main.js start-up)
 let canAdminister = false;
 
+/*
+    The user's profile is one JSON document per user, already carrying
+    their worksheet column widths. Anything else that is theirs rather
+    than the instance's goes in it under its own key, so a preference
+    follows them to another machine instead of living in one browser's
+    storage.
+
+    Reads are from the copy loaded at sign-in; writes go as a patch, so
+    two settings saved from two tabs do not overwrite each other
+    wholesale.
+*/
+/*
+    The profile is registered in the catalog's data store while the app
+    loads, so anything that runs earlier finds no store at all -- not an
+    empty one. Asked before then, these say "nothing yet" rather than
+    throwing, because a preference that cannot be read is never a reason
+    for the app not to start.
+*/
+function heldProfile() {
+    let store = catalog.store();
+
+    if (typeof store.data !== "function" || !store.data().profile) {
+        return null;
+    }
+    return store.data().profile();
+}
+
+function profileValue(key) {
+    let held = heldProfile();
+
+    if (!held || !held.data) {
+        return undefined;
+    }
+    return held.data[key];
+}
+
+function profileSave(key, value) {
+    let held = heldProfile();
+    let next;
+    let patch;
+
+    if (typeof catalog.store().data !== "function") {
+        return Promise.resolve();
+    }
+
+    function kept(etag) {
+        next.etag = etag;
+        catalog.store().data().profile(next);
+    }
+
+    // No profile yet: the first thing anybody saves creates one.
+    if (!held) {
+        next = {data: {}};
+        next.data[key] = f.copy(value);
+        return f.datasource().request({
+            method: "PUT",
+            path: "/profile",
+            body: next.data
+        }).then(kept);
+    }
+
+    next = f.copy(held);
+    next.data = next.data || {};
+    if (value === undefined) {
+        delete next.data[key];
+    } else {
+        next.data[key] = f.copy(value);
+    }
+
+    patch = jsonpatch.compare(held.data, next.data);
+    if (!patch || !patch.length) {
+        return Promise.resolve();
+    }
+    return f.datasource().request({
+        method: "PATCH",
+        path: "/profile",
+        body: {
+            etag: held.etag,
+            patch
+        }
+    }).then(kept);
+}
+
+/*
+    How large the whole interface is drawn, as a percentage.
+
+    The stylesheet carries the default (--fb-ui-scale); this overrides it
+    at the root when somebody moves the control. It is the whole app
+    rather than one worksheet: the old per-sheet zoom was never saved
+    anywhere, so nobody could have been relying on it, and wanting one
+    sheet bigger almost always means wanting everything bigger (John,
+    Oct 2026).
+
+    Kept per browser for now, next to the dashboard's reporting date.
+    Both belong in the user's profile, and go there together.
+*/
+const APP_ZOOM_KEY = "fb-app-zoom";
+const APP_ZOOM_DEFAULT = 113;
+const APP_ZOOM_MIN = 50;
+const APP_ZOOM_MAX = 200;
+// The control shows zoom relative to the default, so the default reads
+// 100%; steps and limits are in those shown units.
+const ZOOM_SHOWN_STEP = 5;
+const ZOOM_SHOWN_MIN = 50;
+const ZOOM_SHOWN_MAX = 175;
+// What is being typed into the zoom field, until Enter or blur.
+const zoomDraft = f.prop(null);
+
+/*
+    The scale is also kept in browser storage, not instead of the profile
+    but ahead of it: it has to be applied before the first paint, and the
+    profile has not arrived that early. The profile is what carries it to
+    another machine; storage is what stops this one flashing.
+
+    Storage is switched off in some browsers and throws rather than
+    returning nothing, and a preference that cannot be remembered is no
+    reason for the app not to run.
+*/
+function rememberZoom(pct) {
+    try {
+        window.localStorage.setItem(APP_ZOOM_KEY, String(pct));
+    } catch (ignore) {
+        return;
+    }
+}
+
+function recallZoom() {
+    try {
+        return window.localStorage.getItem(APP_ZOOM_KEY);
+    } catch (ignore) {
+        return null;
+    }
+}
+
+/*
+    Drawing the app at a scale, and CHOOSING that scale, are two
+    different acts and only the second is worth recording.
+
+    Applying one that was already remembered -- at start-up, or when the
+    profile arrives -- must write nothing: there is nothing new to save,
+    and at start-up the attempt ran before the catalog's data store
+    existed and took the whole app down with it.
+*/
+function applyZoom(value) {
+    let wanted = Math.round(Number(value));
+
+    if (
+        !Number.isFinite(wanted) ||
+        wanted < APP_ZOOM_MIN ||
+        wanted > APP_ZOOM_MAX
+    ) {
+        return false;
+    }
+    document.documentElement.style.setProperty(
+        "--fb-ui-scale",
+        wanted / 100
+    );
+    /*
+        A zoom change IS a resize: the window holds the same device
+        pixels but a different number of CSS ones, which is the number
+        everything that measures itself against the viewport cares
+        about. Saying so lets the ribbon re-fit its stages -- and
+        anything else listening -- without each of them having to know
+        the zoom exists.
+    */
+    window.dispatchEvent(new Event("resize"));
+    return wanted;
+}
+
+function appZoom(value) {
+    let held;
+    let wanted;
+
+    if (value !== undefined) {
+        wanted = applyZoom(value);
+        if (wanted !== false) {
+            rememberZoom(wanted);
+            profileSave("appZoom", wanted).catch(function () {
+                // Kept in this browser regardless; a profile that would
+                // not save is not a reason to refuse to resize.
+                return;
+            });
+        }
+    }
+
+    held = document.documentElement.style.getPropertyValue("--fb-ui-scale");
+    if (held) {
+        return Math.round(Number(held) * 100);
+    }
+    return APP_ZOOM_DEFAULT;
+}
+
+function shownZoom(actual) {
+    return Math.round(actual * 100 / APP_ZOOM_DEFAULT);
+}
+
+// Sets zoom from a shown percent, clamped and snapped to whole percent.
+function setShownZoom(shown) {
+    let n = Math.round(Number(shown));
+
+    if (!Number.isFinite(n)) {
+        return;
+    }
+    n = Math.max(ZOOM_SHOWN_MIN, Math.min(ZOOM_SHOWN_MAX, n));
+    appZoom(n * APP_ZOOM_DEFAULT / 100);
+}
+
+// One step from the current shown percent, landing on a multiple of it.
+function stepZoom(direction) {
+    let now = shownZoom(appZoom());
+    let next = (
+        direction > 0
+        ? Math.floor(now / ZOOM_SHOWN_STEP + 1) * ZOOM_SHOWN_STEP
+        : Math.ceil(now / ZOOM_SHOWN_STEP - 1) * ZOOM_SHOWN_STEP
+    );
+
+    setShownZoom(next);
+}
+
+/*
+    Applied before the first render rather than after: the app appearing
+    at one size and jumping to another is worse than either size. This
+    runs before anything else is loaded, so it must touch nothing but
+    the stylesheet.
+*/
+function applyStoredZoom() {
+    let held = recallZoom();
+
+    if (held) {
+        applyZoom(held);
+    }
+}
+
+/*
+    Run once the profile is in: what this machine remembered may be
+    stale, or there may be nothing remembered here at all because this
+    is a machine the user has not signed in on before.
+*/
+function applyProfileZoom() {
+    let held = profileValue("appZoom");
+
+    if (held) {
+        // Already what the profile says, so applied and not saved back.
+        applyZoom(held);
+        rememberZoom(held);
+    }
+}
+
 // For workbook management
 const template = f.prop("");
 const newname = f.prop("");
+
+// The dashboard's reporting date while its dialog is open; empty means
+// today. Only written back to the board when the dialog is accepted.
+const asOfPending = f.prop("");
+const asOfId = f.createId();
+
+/*
+    For the Add Tile dialog. `addTileWhat` is either a source key or the
+    sentinel below, meaning a tile of chosen metrics rather than one
+    source's measure. `addTileOpts` collects whatever questions the
+    chosen source said it accepts, keyed by the tile property each sets,
+    so nothing here knows what a dimension or a measure is.
+*/
+const ADD_TILE_KPIS = "__kpis";
+const ADD_TILE_HIST = "__histogram";
+const ADD_TILE_BUCKETS = [
+    {value: "day", label: "Daily"},
+    {value: "week", label: "Weekly"},
+    {value: "month", label: "Monthly"}
+];
+// Names the max-horizon field's unit after whichever bucket is picked --
+// matches dashboard.js's own DASH_HIST_NOUNS, pluralized for this prompt.
+const ADD_TILE_HORIZON_NOUNS = {
+    day: "days",
+    week: "weeks",
+    month: "months"
+};
+// In board cells, which are half the size they were: the board was
+// doubled so a tile can be nudged by half of what used to be the
+// smallest possible step (see DASH_COLS in dashboard.js). The sizes
+// themselves are unchanged -- Medium is the same Medium.
+const ADD_TILE_SIZES = [
+    {value: "small", label: "Small", cols: 8, rows: 4},
+    {value: "medium", label: "Medium", cols: 10, rows: 6},
+    {value: "large", label: "Large", cols: 14, rows: 8},
+    {value: "wide", label: "Wide", cols: 18, rows: 6},
+    {value: "tall", label: "Tall", cols: 8, rows: 10}
+];
+/*
+    How a tile is judged. These are the framework's own options rather
+    than a source's: the framework works the target out from them, so
+    they apply to any source and to a metrics tile alike.
+*/
+const ADD_TILE_TARGETS = [
+    {value: "auto", label: "Each metric's own target, else prior period"},
+    {value: "history", label: "Against prior period"},
+    {value: "growth", label: "A percentage above prior period"},
+    {value: "fixed", label: "A number I set"},
+    {value: "none", label: "Nothing"}
+];
+const addTileTarget = f.prop("auto");
+const addTileTargetValue = f.prop("");
+const addTileFilter = f.prop("");
+const addTileWhat = f.prop(ADD_TILE_KPIS);
+const addTileOpts = f.prop({});
+const addTileKpis = f.prop([]);
+/*
+    The Add Tile metrics picker's two lists: which rows are highlighted
+    in each, and the row a shift click measures its run from. The drag
+    state says which list a drag started in and where it would land, so
+    the row under the pointer can show the insertion line.
+*/
+const addTileAvailSel = f.prop([]);
+const addTileChosenSel = f.prop([]);
+const addTileAvailAnchor = f.prop(null);
+const addTileChosenAnchor = f.prop(null);
+const addTileDragFrom = f.prop(null);
+const addTileDrop = f.prop(null);
+
+/**
+    Forgets what was highlighted in the Add Tile metrics picker. The
+    chosen metrics themselves are the caller's business -- editing a
+    tile keeps them, adding one does not.
+*/
+function clearMetricsPicker() {
+    addTileAvailSel([]);
+    addTileChosenSel([]);
+    addTileAvailAnchor(null);
+    addTileChosenAnchor(null);
+    addTileDragFrom(null);
+    addTileDrop(null);
+}
+const addTileSize = f.prop("medium");
+const addTileDisplay = f.prop("bullets");
+const addTileSpark = f.prop(false);
+const addTileHideNames = f.prop(false);
+// Blank means the tile names itself from its settings.
+const addTileHeading = f.prop("");
+const addTileSchedules = f.prop([]);
+const addTileBucket = f.prop("week");
+const addTileValue = f.prop("amount");
+// Blank means the default forward window for the bucket (DASH_HIST_SPAN);
+// a number caps how many buckets ahead of "now" the histogram draws.
+const addTileMaxHorizon = f.prop("");
+const addTileId = f.createId();
+// The tile being edited, or null when the dialog is adding a new one.
+const addTileEditingId = f.prop(null);
+
+/**
+    Opens the Add Tile dialog with an existing tile's settings already in
+    it, aimed at replacing that tile rather than appending a new one --
+    the reverse of what addTileDlg.onOk reads back out. Called from the
+    dashboard's own edit control (dashboard.js has no way to reach this
+    file directly, hence the indirection through a registered global).
+*/
+function openTileEditor(tile) {
+    let choices = catalog.store().global().dashboardTileChoices;
+    let offer = (
+        choices
+        ? choices()
+        : {kpis: [], sources: []}
+    );
+    let picked = offer.sources.find((one) => one.key === tile.source);
+    let size = ADD_TILE_SIZES.find(
+        (one) => one.cols === tile.cols && one.rows === tile.rows
+    );
+    let kpis = tile.kpis || [];
+    let opts = {};
+
+    let schedules = tile.schedules || [];
+
+    addTileEditingId(tile.id);
+    addTileFilter("");
+    clearMetricsPicker();
+    if (tile.type === "kpi") {
+        addTileWhat(ADD_TILE_KPIS);
+    } else if (tile.type === "histogram") {
+        addTileWhat(ADD_TILE_HIST);
+    } else {
+        addTileWhat(tile.source);
+    }
+    addTileHeading(
+        (tile.heading && tile.heading !== "Key Metrics")
+        ? tile.heading
+        : ""
+    );
+    addTileSchedules(schedules.slice());
+    addTileBucket(tile.bucket || "week");
+    addTileValue(tile.value || "amount");
+    addTileMaxHorizon(
+        tile.maxHorizon
+        ? String(tile.maxHorizon)
+        : ""
+    );
+    addTileKpis(kpis.slice());
+    // Falls back to Medium when the tile was resized by dragging rather
+    // than picked from this list -- there is no "custom" entry to show.
+    addTileSize(
+        size
+        ? size.value
+        : "medium"
+    );
+    addTileDisplay(tile.display || "bullets");
+    addTileSpark(tile.showSpark === true);
+    addTileHideNames(tile.hideLabels === true);
+    addTileTarget(tile.targetMode || "auto");
+    addTileTargetValue(
+        (tile.targetValue === undefined || tile.targetValue === null)
+        ? ""
+        : String(tile.targetValue)
+    );
+    if (picked) {
+        picked.options.forEach(function (option) {
+            opts[option.key] = (
+                tile[option.key] === undefined
+                ? option.default
+                : tile[option.key]
+            );
+        });
+    }
+    addTileOpts(opts);
+    addTileDlg.title("Edit tile");
+    addTileDlg.buttonOk().label("Save");
+    addTileDlg.show();
+}
+
+// Targets dialog draft by metric key: {basis, amount, better}; "" basis
+// means no target.
+const targetsDraft = f.prop({});
+const targetsFilter = f.prop("");
+
+// For saving the board's arrangement as a layout everyone can start from
+const layoutName = f.prop("");
+const layoutToDelete = f.prop("");
+const layoutDeleteId = f.createId();
+const layoutIsDefault = f.prop(false);
+const layoutNameId = f.createId();
+const layoutDefaultId = f.createId();
 function templates() {
     return Object.keys(workbooks).filter(
         (k) => workbooks[k].data.isTemplate()
@@ -413,7 +920,165 @@ function goGlobalSettings() {
     @return {Array}
 */
 function homeRibbonGroups() {
+    let dashStatus = catalog.store().global().dashboardRefreshStatus;
+    let getAsOf = catalog.store().global().dashboardAsOf;
+    let isRefreshing = (
+        dashStatus
+        ? dashStatus() === "running"
+        : false
+    );
+    let getLayoutName = catalog.store().global().dashboardLayoutName;
+    let dashAsOf = (
+        getAsOf
+        ? getAsOf()
+        : null
+    );
+    let dashLayout = (
+        getLayoutName
+        ? getLayoutName()
+        : null
+    );
+    let dashZoom = appZoom();
+
     return [{
+        label: "Dashboard",
+        buttons: [{
+            label: "Dashboard",
+            icon: "dashboard",
+            /*
+                The board is the Home route, and until now the only way
+                back to it from a workbook was the root URL. These
+                buttons show on every page's Home tab, so this is the
+                way back from wherever you are (John, Oct 2026).
+            */
+            title: "Open the dashboard",
+            onclick: () => m.route.set("/home")
+        }, {
+            label: "Add Tile",
+            icon: "add_chart",
+            title: "Put another tile on the dashboard",
+            onclick: function () {
+                addTileEditingId(null);
+                addTileFilter("");
+                addTileHeading("");
+                // Without this a fresh tile opens carrying whatever
+                // the last edited tile showed -- invisible when the
+                // metrics were checkboxes somewhere down a scrolling
+                // list, obvious now they sit in a list of their own.
+                addTileKpis([]);
+                clearMetricsPicker();
+                addTileDlg.title("Add tile");
+                addTileDlg.buttonOk().label("Add");
+                addTileDlg.show();
+            }
+        }, {
+            label: "Targets",
+            icon: "flag",
+            // Anyone may look; only an administrator may change.
+            title: (
+                isAdmin
+                ? "Set what each metric is aiming for"
+                : "See what each metric is aiming for"
+            ),
+            onclick: function () {
+                let stored = catalog.store().global().dashboardTargets;
+                let held = (
+                    stored
+                    ? stored()
+                    : {}
+                );
+                let draft = {};
+
+                Object.keys(held).forEach(function (key) {
+                    draft[key] = {
+                        amount: String(held[key].amount),
+                        basis: held[key].basis,
+                        better: held[key].better || ""
+                    };
+                });
+                targetsDraft(draft);
+                targetsFilter("");
+                targetsDlg.show();
+            }
+        }, {
+            label: "Refresh",
+            icon: "refresh",
+            /*
+                A rebuild can take a while, so the button says it is busy
+                rather than quietly accepting a second press. What it is
+                working on, and how it went, are on the board itself.
+            */
+            title: (
+                isRefreshing
+                ? "Rebuilding the figures now"
+                : "Rebuild the figures the dashboard shows"
+            ),
+            disabled: isRefreshing,
+            onclick: function () {
+                let refresh = catalog.store().global().dashboardRefresh;
+
+                if (refresh) {
+                    refresh();
+                }
+            }
+        }, {
+            label: "Save Layout",
+            icon: "bookmark_add",
+            /*
+                The board is composed from whatever has registered until
+                somebody saves an arrangement. Saving one is what turns it
+                into something the instance keeps and others can start
+                from -- which is why this is the only button here that
+                writes anything shared.
+            */
+            title: (
+                dashLayout
+                ? "Showing the \"" + dashLayout + "\" layout. Save it " +
+                "again, or under another name."
+                : "Save this arrangement as a layout"
+            ),
+            onclick: function () {
+                let listed = catalog.store().global().dashboardLayouts;
+                let rows = (
+                    listed
+                    ? listed()
+                    : []
+                );
+                let existing = rows.find(
+                    (row) => row.name === dashLayout
+                );
+
+                layoutName(dashLayout || "");
+                layoutIsDefault(Boolean(existing && existing.isDefault));
+                saveLayoutDlg.show();
+            }
+        }, {
+            label: "Delete Layout",
+            icon: "playlist_remove",
+            title: "Remove a saved layout",
+            onclick: function () {
+                layoutToDelete("");
+                deleteLayoutDlg.show();
+            }
+        }, {
+            label: "As Of",
+            icon: "event",
+            /*
+                Says the date it is set to rather than "Set reporting
+                date", so the board's state can be read off the ribbon
+                without opening anything.
+            */
+            title: (
+                dashAsOf
+                ? "Reporting as of " + dashAsOf + ". Press to change."
+                : "Reporting as of today. Press to pick a fixed date."
+            ),
+            onclick: function () {
+                asOfPending(dashAsOf || "");
+                asOfDlg.show();
+            }
+        }]
+    }, {
         label: "Accounts",
         buttons: acctMenu.actionButtons()
     }, {
@@ -527,17 +1192,68 @@ function homeRibbonGroups() {
             )
         }]
     }, {
-        label: "Dashboard",
+        /*
+            The window's own controls, not the work's -- which is why
+            this group sits apart on the far side, the way Office keeps
+            view controls away from the commands (John, Oct 2026).
+        */
+        atEnd: true,
+        label: "View",
+        small: true,
         buttons: [{
-            label: "Refresh",
-            icon: "refresh",
-            title: "Recalculate the figures the dashboard shows",
-            onclick: function () {
-                let refresh = catalog.store().global().dashboardRefresh;
+            label: "Zoom In",
+            icon: "zoom_in",
+            title: "Draw everything larger",
+            disabled: shownZoom(dashZoom) >= ZOOM_SHOWN_MAX,
+            onclick: () => stepZoom(1)
+        }, {
+            label: "Zoom Out",
+            icon: "zoom_out",
+            title: "Draw everything smaller",
+            disabled: shownZoom(dashZoom) <= ZOOM_SHOWN_MIN,
+            onclick: () => stepZoom(-1)
+        }, {
+            /*
+                Typed into a draft, applied on Enter or blur: bound
+                straight to the zoom, every redraw put the old number
+                back mid-typing. Escape abandons the draft.
+            */
+            render: function () {
+                let draft = zoomDraft();
 
-                if (refresh) {
-                    refresh();
+                function commit(e) {
+                    if (zoomDraft() !== null) {
+                        setShownZoom(e.target.value);
+                        zoomDraft(null);
+                    }
                 }
+
+                return m("label", {class: "fb-rb-field fb-rb-field-sm"}, [
+                    m("input", {
+                        class: "fb-rb-field-input",
+                        type: "text",
+                        inputmode: "numeric",
+                        "aria-label": "Zoom percent",
+                        title: "Zoom percent; type one and press Enter",
+                        value: (
+                            draft === null
+                            ? shownZoom(dashZoom)
+                            : draft
+                        ),
+                        oninput: (e) => zoomDraft(e.target.value),
+                        onblur: commit,
+                        onkeydown: function (e) {
+                            if (e.key === "Enter") {
+                                commit(e);
+                            } else if (e.key === "Escape") {
+                                zoomDraft(null);
+                            } else {
+                                e.redraw = false;
+                            }
+                        }
+                    }),
+                    m("span", {class: "fb-rb-field-label"}, "%")
+                ]);
             }
         }]
     }];
@@ -579,6 +1295,33 @@ const homeDialogs = {
             }),
             m(components.dialog, {
                 viewModel: g.navCategoryErrDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.asOfDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.saveLayoutDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.saveLayoutErrDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.addTileDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.addTileErrDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.deleteLayoutDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.deleteLayoutErrDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.targetsDlg
+            }),
+            m(components.dialog, {
+                viewModel: g.targetsErrDlg
             })
         ];
     }
@@ -612,9 +1355,14 @@ const home = {
     },
     oncreate: function () {
         let title = document.getElementById("fb-title");
+        let favicon = document.getElementById("fb-favicon");
+        let icon = brandIcon();
 
         if (title) {
-            title.text = "Featherbone";
+            title.text = brandTitle();
+        }
+        if (favicon && icon) {
+            favicon.href = icon;
         }
     },
     onupdate: function () {
@@ -635,6 +1383,31 @@ const home = {
             ? globals.dashboardTitle()
             : f.currentUser().splashTitle
         );
+        let listedLayouts = (
+            globals.dashboardLayouts
+            ? globals.dashboardLayouts()
+            : []
+        );
+        let pickedLayout = (
+            globals.dashboardLayoutName
+            ? globals.dashboardLayoutName()
+            : null
+        );
+        // Read once here rather than inside dashboard.js's own view, so
+        // the one image paints as a single backdrop behind the title/
+        // picker row below AND the dashboard frame, instead of two
+        // separate fills that would restart (and misalign) at the
+        // board's own edge -- see wallpaperStyle's doc comment.
+        let wallStyle = (
+            globals.dashboardWallpaperStyle
+            ? globals.dashboardWallpaperStyle()
+            : {}
+        );
+        let pageClass = (
+            wallStyle["background-image"]
+            ? "fb-dash-page fb-dash-page-wallpaper"
+            : "fb-dash-page"
+        );
 
         return [
             m(components.envBanner),
@@ -652,16 +1425,47 @@ const home = {
                         style: {width: "100%"}
                     }, [
                         m("div", {
-                            class: toolbarClass + " fb-toolbar-home"
+                            class: pageClass,
+                            style: wallStyle
                         }, [
                             m("div", {
-                                class: "fb-header-home"
-                            }, dashTitle),
-                            m("div", {
-                                class: "fb-toolbar-fill"
-                            })
-                        ]),
-                        m(components.dashboard)
+                                class: toolbarClass + " fb-toolbar-home"
+                            }, [
+                                m("div", {
+                                    class: "fb-header-home"
+                                }, dashTitle),
+                                m("div", {
+                                    class: "fb-toolbar-fill"
+                                }),
+                                m("select", {
+                                    class: "fb-layout-picker",
+                                    title: (
+                                        "Switch which saved layout you see"
+                                    ),
+                                    onchange: function (e) {
+                                        let use = globals.dashboardUseLayout;
+
+                                        if (use) {
+                                            use(e.target.value || null);
+                                        }
+                                    },
+                                    value: pickedLayout || ""
+                                }, [
+                                    m("option", {
+                                        value: ""
+                                    }, "Standard arrangement")
+                                ].concat(listedLayouts.map(function (row) {
+                                    return m("option", {
+                                        value: row.name
+                                    }, (
+                                        row.isDefault
+                                        ? row.label + " (default)"
+                                        : row.label
+                                    ));
+                                })))
+                            ]),
+                            m(components.dashboard)
+                        ])
                     ])
                 ]
             ])
@@ -1434,6 +2238,1277 @@ function initApp() {
         deleteWbTemplateDlg.buttonOk().style().background = "red";
         deleteWbTemplateDlg.buttonOk().class("fb-button-delete");
 
+        /*
+            View model for the dashboard's reporting date. Empty means
+            today, which is both the default and the way back from a
+            pinned date -- a second control to unpin would be a second
+            thing to explain.
+        */
+        asOfDlg = viewModels.dialog({
+            icon: "event",
+            title: "Dashboard reporting date"
+        });
+        asOfDlg.content = function () {
+            return m("div", {
+                class: "pure-form pure-form-aligned"
+            }, [
+                m("div", {
+                    class: "pure-control-group"
+                }, [
+                    m("label", {
+                        for: asOfId
+                    }, "As of:"),
+                    m("input", {
+                        id: asOfId,
+                        type: "date",
+                        onchange: (e) => asOfPending(e.target.value),
+                        value: asOfPending()
+                    })
+                ]),
+                m("div", {
+                    class: "fb-dialog-note"
+                }, (
+                    "Leave this empty to report as of today. A fixed " +
+                    "date is what makes year-to-date figures and " +
+                    "prior-year comparisons worth showing on a " +
+                    "database whose sample data sits in another year."
+                ))
+            ]);
+        };
+        /*
+            The metrics list on the Add Tile dialog: what is available
+            on the left, what the tile actually shows on the right.
+
+            Checkboxes said which metrics were on a tile but nothing
+            about the order its rows appear in -- that was whatever
+            order the boxes happened to be ticked in, so a tile read
+            as arbitrary and there was no way to change it (John, Oct
+            2026). The right-hand list IS the tile, top to bottom:
+            drag a row within it, or use the arrows, and the tile
+            follows.
+
+            Left is one flat alphabetical list of "Group - Metric".
+            The prefix carries the grouping the old module headings
+            did, and sorting the whole label keeps one contributor's
+            metrics together anyway, so the headings are redundant.
+            The filter narrows the left list only -- what is already
+            chosen is never hidden, since a filter that hides
+            somebody's work loses it silently.
+
+            Several rows can be taken at once (ctrl or cmd click to
+            add one, shift click for a run), because moving a dozen
+            metrics one at a time is the thing this replaces.
+        */
+        function metricsPicker(offered) {
+            let needle = addTileFilter().trim().toLowerCase();
+            let chosen = addTileKpis();
+            let byKey = {};
+            let avail;
+
+            offered.forEach(function (kpi) {
+                byKey[kpi.key] = kpi;
+            });
+
+            // A metric names its contributor as well as itself: two
+            // packages may well both ship an "On Time Completions".
+            function label(key) {
+                let kpi = byKey[key];
+
+                if (!kpi) {
+                    return key;
+                }
+                return (
+                    (kpi.group || kpi.module || "Other") + " - " + kpi.label
+                );
+            }
+
+            avail = offered.map(function (kpi) {
+                return kpi.key;
+            }).filter(function (key) {
+                return chosen.indexOf(key) === -1;
+            }).filter(function (key) {
+                return (
+                    !needle || label(key).toLowerCase().indexOf(needle) > -1
+                );
+            }).sort(function (a, b) {
+                return label(a).localeCompare(label(b));
+            });
+
+            /*
+                Puts `keys` into the chosen list at `at`, whether they
+                come from the left list or are being shuffled within
+                the right one -- the two are the same operation, since
+                a key can only be in one list at a time. `from` says
+                which order the moved rows keep among themselves: the
+                left list's alphabetical one, or the order they
+                already sit in on the right.
+            */
+            function moveTo(keys, at, from) {
+                let kept = chosen.filter(function (key) {
+                    return keys.indexOf(key) === -1;
+                });
+                // Pulling rows out from above the drop point shifts it.
+                let lifted = chosen.slice(0, at).filter(function (key) {
+                    return keys.indexOf(key) > -1;
+                }).length;
+                let where = at - lifted;
+                let ordered = (
+                    from === "avail"
+                    ? avail
+                    : chosen
+                ).filter(function (key) {
+                    return keys.indexOf(key) > -1;
+                });
+
+                if (!ordered.length) {
+                    return;
+                }
+                addTileKpis(
+                    kept.slice(0, where).concat(ordered, kept.slice(where))
+                );
+                addTileAvailSel([]);
+                addTileChosenSel(ordered);
+            }
+
+            function take(keys) {
+                let ordered = chosen.filter(function (key) {
+                    return keys.indexOf(key) > -1;
+                });
+
+                if (!ordered.length) {
+                    return;
+                }
+                addTileKpis(chosen.filter(function (key) {
+                    return keys.indexOf(key) === -1;
+                }));
+                addTileChosenSel([]);
+                addTileAvailSel(ordered);
+            }
+
+            /*
+                Moves every selected row one place up or down, as a
+                block: a row stays put when the place it would go to
+                is off the end or is itself selected, which is what
+                keeps a multiple-row selection together at the edges.
+            */
+            function nudge(delta) {
+                let next = chosen.slice();
+                let sel = addTileChosenSel();
+                let order = next.map(function (ignore, idx) {
+                    return idx;
+                });
+
+                if (delta > 0) {
+                    order.reverse();
+                }
+                order.forEach(function (idx) {
+                    let to = idx + delta;
+                    let key = next[idx];
+
+                    if (
+                        sel.indexOf(key) > -1 &&
+                        to >= 0 && to < next.length &&
+                        sel.indexOf(next[to]) === -1
+                    ) {
+                        next[idx] = next[to];
+                        next[to] = key;
+                    }
+                });
+                addTileKpis(next);
+            }
+
+            function canNudge(delta) {
+                let sel = addTileChosenSel();
+
+                return sel.length > 0 && sel.some(function (key) {
+                    let to = chosen.indexOf(key) + delta;
+
+                    return (
+                        to >= 0 && to < chosen.length &&
+                        sel.indexOf(chosen[to]) === -1
+                    );
+                });
+            }
+
+            /*
+                Click to select, ctrl or cmd click to add one, shift
+                click for a run from the last plain click.
+            */
+            function clicked(e, key, list, selProp, anchorProp) {
+                let sel = selProp();
+                let from = list.indexOf(anchorProp());
+                let to = list.indexOf(key);
+
+                if (e.shiftKey && from > -1) {
+                    selProp(list.slice(
+                        Math.min(from, to),
+                        Math.max(from, to) + 1
+                    ));
+                } else if (e.ctrlKey || e.metaKey) {
+                    selProp(
+                        sel.indexOf(key) > -1
+                        ? sel.filter((one) => one !== key)
+                        : sel.concat([key])
+                    );
+                    anchorProp(key);
+                } else {
+                    selProp([key]);
+                    anchorProp(key);
+                }
+            }
+
+            // Dragging anything not already selected takes that row
+            // alone, the way a file manager does.
+            function dragging(key, selProp) {
+                let sel = selProp();
+
+                return (
+                    sel.indexOf(key) > -1
+                    ? sel
+                    : [key]
+                );
+            }
+
+            function markDrop(e, side, at) {
+                let drop = addTileDrop();
+
+                e.preventDefault();
+                if (drop && drop.side === side && drop.at === at) {
+                    // dragover fires continuously; only a change is
+                    // worth a redraw.
+                    e.redraw = false;
+                    return;
+                }
+                addTileDrop({side, at});
+            }
+
+            function row(key, side, idx) {
+                let isChosen = side === "chosen";
+                let siblings = (
+                    isChosen
+                    ? chosen
+                    : avail
+                );
+                let selProp = (
+                    isChosen
+                    ? addTileChosenSel
+                    : addTileAvailSel
+                );
+                let anchorProp = (
+                    isChosen
+                    ? addTileChosenAnchor
+                    : addTileAvailAnchor
+                );
+                let drop = addTileDrop();
+                let classes = ["fb-dual-row"];
+
+                if (selProp().indexOf(key) > -1) {
+                    classes.push("fb-dual-row-selected");
+                }
+                if (isChosen && drop && drop.side === "chosen") {
+                    if (drop.at === idx) {
+                        classes.push("fb-dual-row-drop-before");
+                    }
+                    if (drop.at === idx + 1 && idx === chosen.length - 1) {
+                        classes.push("fb-dual-row-drop-after");
+                    }
+                }
+                return m("li", {
+                    class: classes.join(" "),
+                    draggable: true,
+                    key,
+                    title: label(key),
+                    onclick: function (e) {
+                        clicked(e, key, siblings, selProp, anchorProp);
+                    },
+                    ondblclick: function () {
+                        if (isChosen) {
+                            take([key]);
+                        } else {
+                            moveTo([key], chosen.length, "avail");
+                        }
+                    },
+                    ondragstart: function (e) {
+                        let moved = dragging(key, selProp);
+
+                        selProp(moved);
+                        addTileDragFrom(side);
+                        // Firefox will not start a drag without this.
+                        e.dataTransfer.setData("text/plain", moved.join(" "));
+                        e.dataTransfer.effectAllowed = "move";
+                    },
+                    ondragend: function (e) {
+                        addTileDragFrom(null);
+                        addTileDrop(null);
+                        e.redraw = false;
+                    },
+                    ondragover: function (e) {
+                        let half = e.currentTarget.getBoundingClientRect();
+                        let after = e.clientY > half.top + half.height / 2;
+
+                        markDrop(e, side, (
+                            isChosen
+                            ? idx + Number(after)
+                            : 0
+                        ));
+                    },
+                    ondrop: function (e) {
+                        let from = addTileDragFrom();
+                        let landing = addTileDrop();
+
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (isChosen) {
+                            moveTo(
+                                (
+                                    from === "chosen"
+                                    ? addTileChosenSel()
+                                    : addTileAvailSel()
+                                ),
+                                (
+                                    landing
+                                    ? landing.at
+                                    : chosen.length
+                                ),
+                                from
+                            );
+                        } else if (from === "chosen") {
+                            take(addTileChosenSel());
+                        }
+                        addTileDragFrom(null);
+                        addTileDrop(null);
+                    }
+                }, label(key));
+            }
+
+            function list(side, keys, empty) {
+                let isChosen = side === "chosen";
+
+                return m("ul", {
+                    class: (
+                        (
+                            addTileDrop() &&
+                            addTileDrop().side === side &&
+                            addTileDragFrom() &&
+                            addTileDragFrom() !== side
+                        )
+                        ? "fb-dual-list fb-dual-list-over"
+                        : "fb-dual-list"
+                    ),
+                    // Dropping below the last row, on the empty part
+                    // of the box, means the end of the list.
+                    ondragover: (e) => markDrop(e, side, keys.length),
+                    ondrop: function (e) {
+                        let from = addTileDragFrom();
+
+                        e.preventDefault();
+                        if (isChosen && from === "avail") {
+                            moveTo(addTileAvailSel(), chosen.length, "avail");
+                        } else if (isChosen) {
+                            moveTo(
+                                addTileChosenSel(),
+                                chosen.length,
+                                "chosen"
+                            );
+                        } else if (from === "chosen") {
+                            take(addTileChosenSel());
+                        }
+                        addTileDragFrom(null);
+                        addTileDrop(null);
+                    }
+                }, (
+                    keys.length
+                    ? keys.map(function (key, idx) {
+                        return row(key, side, idx);
+                    })
+                    : m("li", {class: "fb-dual-empty"}, empty)
+                ));
+            }
+
+            function arrow(icon, hint, why, disabled, onclick) {
+                return m("button[type=button]", {
+                    class: (
+                        disabled
+                        ? "pure-button fb-icon-only fb-button-disabled"
+                        : "pure-button fb-icon-only"
+                    ),
+                    disabled,
+                    title: (
+                        disabled
+                        ? why
+                        : hint
+                    ),
+                    onclick
+                }, f.icon(icon, "fb-button-icon"));
+            }
+
+            return m("div", {class: "fb-dual"}, [
+                m("div", {class: "fb-dual-side"}, [
+                    m("div", {class: "fb-dual-label"}, "Available"),
+                    m("input", {
+                        class: "fb-dialog-picker-filter",
+                        type: "search",
+                        placeholder: "Filter metrics",
+                        oninput: function (e) {
+                            addTileFilter(e.target.value);
+                            addTileAvailSel([]);
+                        },
+                        value: addTileFilter()
+                    }),
+                    list("avail", avail, (
+                        needle
+                        ? "No metric matches that."
+                        : "Every metric is on the tile."
+                    )),
+                    m("div", {class: "fb-dual-note"}, arrow(
+                        "arrow_forward",
+                        "Put the selected metrics on the tile",
+                        "Select a metric on the left first",
+                        !addTileAvailSel().length,
+                        () => moveTo(
+                            addTileAvailSel(),
+                            chosen.length,
+                            "avail"
+                        )
+                    ))
+                ]),
+                m("div", {class: "fb-dual-side"}, [
+                    m("div", {class: "fb-dual-label"}, "On the tile"),
+                    m("div", {
+                        class: "fb-dual-hint"
+                    }, "Top to bottom, as the tile shows them"),
+                    list("chosen", chosen, "Nothing on this tile yet."),
+                    m("div", {class: "fb-dual-note"}, [
+                        arrow(
+                            "arrow_back",
+                            "Take the selected metrics off the tile",
+                            "Select a metric on the right first",
+                            !addTileChosenSel().length,
+                            () => take(addTileChosenSel())
+                        ),
+                        m("span", {class: "fb-toolbar-fill"}),
+                        arrow(
+                            "arrow_upward",
+                            "Move up",
+                            (
+                                addTileChosenSel().length
+                                ? "Already at the top"
+                                : "Select a metric on the right first"
+                            ),
+                            !canNudge(-1),
+                            () => nudge(-1)
+                        ),
+                        arrow(
+                            "arrow_downward",
+                            "Move down",
+                            (
+                                addTileChosenSel().length
+                                ? "Already at the bottom"
+                                : "Select a metric on the right first"
+                            ),
+                            !canNudge(1),
+                            () => nudge(1)
+                        )
+                    ])
+                ])
+            ]);
+        }
+
+        /*
+            View model for removing a saved layout, shaped like the
+            workbook template one above: a list to choose from and a red
+            confirm, rather than a control on the board itself, because
+            deleting a layout others may be using is not a thing to do
+            by brushing against it.
+
+            The service decides whether it is allowed, so a refusal is
+            shown rather than guessed at here.
+        */
+        deleteLayoutErrDlg = viewModels.dialog({
+            icon: "error",
+            title: "Error"
+        });
+        deleteLayoutDlg = viewModels.dialog({
+            icon: "playlist_remove",
+            title: "Delete dashboard layout"
+        });
+        deleteLayoutDlg.content = function () {
+            let listed = catalog.store().global().dashboardLayouts;
+            let rows = (
+                listed
+                ? listed()
+                : []
+            );
+
+            return m("div", {
+                class: "pure-form pure-form-aligned"
+            }, [
+                m("div", {
+                    class: "pure-control-group"
+                }, [
+                    m("label", {
+                        for: layoutDeleteId
+                    }, "Layout:"),
+                    m("select", {
+                        id: layoutDeleteId,
+                        onchange: (e) => layoutToDelete(e.target.value),
+                        value: layoutToDelete()
+                    }, [
+                        // Named, not blank: an empty first row reads
+                        // as a glitch rather than as "nothing chosen".
+                        m("option", {value: ""}, "(choose a layout)")
+                    ].concat(rows.map(function (row) {
+                        return m("option", {
+                            value: row.name
+                        }, (
+                            row.isDefault
+                            ? row.label + " (default)"
+                            : row.label
+                        ));
+                    })))
+                ]),
+                m("div", {
+                    class: "fb-dialog-note"
+                }, (
+                    "A layout belongs to whoever saved it. Anyone still " +
+                    "using one that is deleted falls back to the " +
+                    "default."
+                ))
+            ]);
+        };
+        deleteLayoutDlg.onOk(function () {
+            let remove = catalog.store().global().dashboardDeleteLayout;
+
+            if (!remove || !layoutToDelete()) {
+                return;
+            }
+            remove(layoutToDelete()).catch(function (err) {
+                deleteLayoutErrDlg.message(err.message);
+                deleteLayoutErrDlg.show();
+            });
+        });
+        deleteLayoutDlg.buttonOk().label("Delete");
+        deleteLayoutDlg.buttonOk().style().background = "red";
+        deleteLayoutDlg.buttonOk().class("fb-button-delete");
+        deleteLayoutDlg.buttonOk().isDisabled = () => !layoutToDelete();
+        deleteLayoutDlg.buttonOk().title = function () {
+            if (!layoutToDelete()) {
+                return "Choose a layout to delete";
+            }
+        };
+
+        /*
+            View model for putting a tile on the board.
+
+            Everything it offers comes from what has registered: the
+            sources, the questions each one accepts, and the metrics a
+            Key Metrics tile can hold. Nothing here knows what revenue,
+            a region or a user count is, which is what lets a package
+            contribute a tile type without the framework being taught
+            about it.
+        */
+        addTileErrDlg = viewModels.dialog({
+            icon: "error",
+            title: "No room"
+        });
+        addTileDlg = viewModels.dialog({
+            icon: "add_chart",
+            title: "Add tile"
+        });
+        addTileDlg.style().width = "520px";
+        addTileDlg.content = function () {
+            let choices = catalog.store().global().dashboardTileChoices;
+            let offer = (
+                choices
+                ? choices()
+                : {kpis: [], sources: []}
+            );
+            let picked = offer.sources.find(
+                (one) => one.key === addTileWhat()
+            );
+            let schedules = offer.schedules || [];
+            let parts = [];
+
+            // Two lists side by side want more room than one column
+            // of fields. Set here rather than once at creation
+            // because it depends on what the dialog is showing, and
+            // the dialog reads its style after asking for content.
+            addTileDlg.style().width = (
+                addTileWhat() === ADD_TILE_KPIS
+                ? "760px"
+                : "520px"
+            );
+
+            function group(label, control) {
+                return m("div", {
+                    class: "pure-control-group"
+                }, [
+                    m("label", label),
+                    control
+                ]);
+            }
+
+            parts.push(m("div", {
+                class: "pure-control-group"
+            }, [
+                m("label", {
+                    for: addTileId
+                }, "Show:"),
+                m("select", {
+                    id: addTileId,
+                    onchange: function (e) {
+                        addTileWhat(e.target.value);
+                        // A time axis wants width.
+                        if (
+                            e.target.value === ADD_TILE_HIST &&
+                            addTileSize() === "medium"
+                        ) {
+                            addTileSize("wide");
+                        }
+                        // The questions belong to the source that was
+                        // chosen, so answers to the last one's are not
+                        // carried over.
+                        addTileOpts({});
+                    },
+                    value: addTileWhat()
+                }, [
+                    m("option", {
+                        value: ADD_TILE_KPIS
+                    }, "Key metrics")
+                ].concat(
+                    schedules.length
+                    ? [m("option", {
+                        value: ADD_TILE_HIST
+                    }, "Due dates (histogram)")]
+                    : []
+                ).concat(offer.sources.map(function (one) {
+                    return m("option", {
+                        value: one.key
+                    }, one.label + " (" + one.module + ")");
+                })))
+            ]));
+
+            parts.push(group("Title:", m("input", {
+                oninput: (e) => addTileHeading(e.target.value),
+                placeholder: "Named from its settings",
+                value: addTileHeading()
+            })));
+
+            if (addTileWhat() === ADD_TILE_KPIS) {
+                parts.push(m("div", {
+                    class: "pure-control-group fb-dialog-wide-group"
+                }, [
+                    m("label", "Metrics:"),
+                    metricsPicker(offer.kpis)
+                ]));
+            } else if (addTileWhat() === ADD_TILE_HIST) {
+                parts.push(group("Orders:", m(
+                    "div",
+                    {class: "fb-dialog-picker-list"},
+                    schedules.map(function (one) {
+                        let held = addTileSchedules();
+
+                        return m("label", [
+                            m("input", {
+                                type: "checkbox",
+                                checked: held.indexOf(one.key) !== -1,
+                                onchange: function (e) {
+                                    let next = held.filter(
+                                        (key) => key !== one.key
+                                    );
+
+                                    if (e.target.checked) {
+                                        next.push(one.key);
+                                    }
+                                    // Keep registration order, so the
+                                    // side-by-side order never shuffles.
+                                    addTileSchedules(schedules.map(
+                                        (sched) => sched.key
+                                    ).filter(
+                                        (key) => next.indexOf(key) !== -1
+                                    ));
+                                }
+                            }),
+                            " " + one.label
+                        ]);
+                    })
+                )));
+                parts.push(group("Buckets:", m("select", {
+                    onchange: (e) => addTileBucket(e.target.value),
+                    value: addTileBucket()
+                }, ADD_TILE_BUCKETS.map(function (one) {
+                    return m("option", {value: one.value}, one.label);
+                }))));
+                parts.push(group("Values:", m("select", {
+                    onchange: (e) => addTileValue(e.target.value),
+                    value: addTileValue()
+                }, [
+                    m("option", {value: "amount"}, "Money"),
+                    m("option", {value: "units"}, "Quantity")
+                ])));
+                parts.push(group("Max horizon:", m("input", {
+                    type: "number",
+                    min: "1",
+                    step: "1",
+                    placeholder: "Default",
+                    oninput: (e) => addTileMaxHorizon(e.target.value),
+                    value: addTileMaxHorizon()
+                })));
+                parts.push(m("div", {
+                    class: "fb-dialog-note"
+                }, (
+                    "How many " + ADD_TILE_HORIZON_NOUNS[addTileBucket()] +
+                    " ahead to show, at most -- orders due later are " +
+                    "folded into the \"After\" total instead of adding " +
+                    "more buckets. Leave this empty for the usual window."
+                )));
+            } else if (picked) {
+                picked.options.forEach(function (option) {
+                    let held = addTileOpts();
+                    let now = (
+                        held[option.key] === undefined
+                        ? option.default
+                        : held[option.key]
+                    );
+
+                    parts.push(group(option.label + ":", m("select", {
+                        onchange: function (e) {
+                            let next = Object.assign({}, addTileOpts());
+
+                            next[option.key] = e.target.value;
+                            addTileOpts(next);
+                        },
+                        value: now
+                    }, option.choices.map(function (choice) {
+                        return m("option", {
+                            value: choice.value
+                        }, choice.label);
+                    }))));
+                });
+
+                parts.push(group("Chart:", m("select", {
+                    onchange: (e) => addTileDisplay(e.target.value),
+                    value: addTileDisplay()
+                }, [
+                    m("option", {value: "bullets"}, "Bars with comparison"),
+                    m("option", {value: "bars"}, "Ranked bars"),
+                    m("option", {value: "table"}, "Numbers only"),
+                    m("option", {
+                        value: "multiples"
+                    }, "Small multiples, a year each")
+                ])));
+
+                // For a tile beside another sorted by name.
+                parts.push(group("Hide names:", m("input", {
+                    type: "checkbox",
+                    checked: addTileHideNames(),
+                    onchange: (e) => addTileHideNames(e.target.checked)
+                })));
+
+                parts.push(group("History:", m("input", {
+                    type: "checkbox",
+                    checked: addTileSpark(),
+                    onchange: (e) => addTileSpark(e.target.checked)
+                })));
+            }
+
+            if (
+                addTileTarget() === "auto" &&
+                addTileWhat() !== ADD_TILE_KPIS
+            ) {
+                addTileTarget("history");
+            }
+            // A histogram is not judged against anything.
+            if (addTileWhat() !== ADD_TILE_HIST) {
+                parts.push(group("Judged:", m("select", {
+                    onchange: function (e) {
+                        addTileTarget(e.target.value);
+                    },
+                    value: addTileTarget()
+                }, ADD_TILE_TARGETS.filter(function (one) {
+                    // Stored targets exist only for metrics.
+                    return (
+                        one.value !== "auto" ||
+                        addTileWhat() === ADD_TILE_KPIS
+                    );
+                }).map(function (one) {
+                    return m("option", {
+                        value: one.value
+                    }, one.label);
+                }))));
+
+                if (addTileTarget() === "growth") {
+                    parts.push(group("Percent:", m("input", {
+                        type: "number",
+                        step: "1",
+                        oninput: (e) => addTileTargetValue(e.target.value),
+                        value: addTileTargetValue()
+                    })));
+                }
+
+                if (addTileTarget() === "fixed") {
+                    parts.push(group("Target:", m("input", {
+                        type: "number",
+                        oninput: (e) => addTileTargetValue(e.target.value),
+                        value: addTileTargetValue()
+                    })));
+                }
+            }
+
+            /*
+                Size is asked only when adding. A tile already on the
+                board has been put where it is and sized by hand, and
+                answering this question again would undo both -- every
+                edit snapping it back to a preset and shoving its
+                neighbours out of the way (John, Oct 2026). Drag its
+                corner to resize it.
+            */
+            if (!addTileEditingId()) {
+                parts.push(group("Size:", m("select", {
+                    onchange: (e) => addTileSize(e.target.value),
+                    value: addTileSize()
+                }, ADD_TILE_SIZES.map(function (size) {
+                    return m("option", {
+                        value: size.value
+                    }, size.label);
+                }))));
+            }
+
+            parts.push(m("div", {
+                class: "fb-dialog-note"
+            }, (
+                "The tile appears straight away. Nothing is kept until " +
+                "you save the layout."
+            )));
+
+            return m("div", {
+                class: "pure-form pure-form-aligned"
+            }, parts);
+        };
+        addTileDlg.onOk(function () {
+            let editingId = addTileEditingId();
+            let add = catalog.store().global().dashboardAddTile;
+            let update = catalog.store().global().dashboardUpdateTile;
+            let size = ADD_TILE_SIZES.find(
+                (one) => one.value === addTileSize()
+            );
+            // Editing says nothing about size, so the tile keeps the one
+            // it has -- see the dialog's own note above.
+            let tile = (
+                editingId
+                ? {}
+                : {cols: size.cols, rows: size.rows}
+            );
+            let placed;
+
+            if (editingId) {
+                if (!update) {
+                    return;
+                }
+            } else if (!add) {
+                return;
+            }
+
+            tile.targetMode = addTileTarget();
+            if (
+                addTileTarget() === "fixed" ||
+                addTileTarget() === "growth"
+            ) {
+                tile.targetValue = Number(addTileTargetValue());
+            }
+
+            let named = addTileHeading().trim();
+
+            if (named) {
+                tile.heading = named;
+            }
+            if (addTileWhat() === ADD_TILE_KPIS) {
+                tile.type = "kpi";
+                tile.heading = named || "Key Metrics";
+                tile.kpis = addTileKpis();
+            } else if (addTileWhat() === ADD_TILE_HIST) {
+                tile.type = "histogram";
+                tile.schedules = addTileSchedules();
+                tile.bucket = addTileBucket();
+                tile.value = addTileValue();
+                tile.maxHorizon = (
+                    Number(addTileMaxHorizon()) > 0
+                    ? Number(addTileMaxHorizon())
+                    : null
+                );
+                delete tile.targetMode;
+            } else {
+                tile.type = "measure";
+                tile.source = addTileWhat();
+                tile.display = addTileDisplay();
+                tile.showSpark = addTileSpark();
+                tile.hideLabels = addTileHideNames();
+                // Whatever the source asked to be asked, handed back
+                // as tile properties for its own load to read.
+                Object.keys(addTileOpts()).forEach(function (key) {
+                    tile[key] = addTileOpts()[key];
+                });
+            }
+
+            placed = (
+                editingId
+                ? update(editingId, tile)
+                : add(tile)
+            );
+            addTileEditingId(null);
+            // Added from a workbook page, the tile is waiting on a board
+            // nobody is looking at. Go and look at it.
+            if (placed && m.route.get() !== "/home") {
+                m.route.set("/home");
+            }
+            if (!placed) {
+                addTileErrDlg.message(
+                    editingId
+                    ? "That tile could not be changed."
+                    : "There is no room left on the board for a tile " +
+                    "that size. Take one off, or choose a smaller size."
+                );
+                addTileErrDlg.show();
+            }
+        });
+        addTileDlg.buttonOk().label("Add");
+        addTileDlg.buttonOk().isDisabled = function () {
+            return (
+                (addTileWhat() === ADD_TILE_KPIS && !addTileKpis().length) ||
+                (
+                    addTileWhat() === ADD_TILE_HIST &&
+                    !addTileSchedules().length
+                )
+            );
+        };
+        addTileDlg.buttonOk().title = function () {
+            if (
+                addTileWhat() === ADD_TILE_KPIS &&
+                !addTileKpis().length
+            ) {
+                return "Choose at least one metric";
+            }
+            if (
+                addTileWhat() === ADD_TILE_HIST &&
+                !addTileSchedules().length
+            ) {
+                return "Choose at least one kind of order";
+            }
+        };
+
+        /*
+            View model for metric targets: a number, or a signed percent
+            of the comparison (negative where lower is better).
+        */
+        targetsErrDlg = viewModels.dialog({
+            icon: "error",
+            title: "Error"
+        });
+        targetsDlg = viewModels.dialog({
+            icon: "flag",
+            title: "Metric targets"
+        });
+        targetsDlg.style().width = "680px";
+        targetsDlg.content = function () {
+            let kpis = catalog.store().global().dashboardKpis;
+            let offered = (
+                kpis
+                ? kpis.list()
+                : []
+            );
+            let needle = targetsFilter().trim().toLowerCase();
+            let shown = offered.filter(function (kpi) {
+                return (
+                    !needle ||
+                    kpi.name.toLowerCase().indexOf(needle) > -1 ||
+                    String(kpi.module).toLowerCase().indexOf(needle) > -1
+                );
+            });
+            let draft = targetsDraft();
+
+            function entry(kpi) {
+                return draft[kpi.key] || {amount: "", basis: "", better: ""};
+            }
+
+            function change(kpi, key, value) {
+                let next = Object.assign({}, targetsDraft());
+
+                next[kpi.key] = Object.assign({}, entry(kpi));
+                next[kpi.key][key] = value;
+                targetsDraft(next);
+            }
+
+            function row(kpi) {
+                let one = entry(kpi);
+                let better = one.better || kpi.better || "higher";
+                let hint = (
+                    one.basis === "percent"
+                    ? (
+                        better === "lower"
+                        ? "% vs comparison, e.g. -5"
+                        : "% vs comparison, e.g. 5"
+                    )
+                    : (
+                        kpi.unit === "percent"
+                        ? "e.g. 95"
+                        : "target"
+                    )
+                );
+
+                return m("div", {class: "fb-target-row"}, [
+                    m("div", {class: "fb-target-name"}, [
+                        m("span", kpi.name),
+                        m("span", {class: "fb-target-module"}, kpi.module)
+                    ]),
+                    m("select", {
+                        disabled: !isAdmin,
+                        onchange: (e) => change(kpi, "basis", e.target.value),
+                        value: one.basis
+                    }, [
+                        m("option", {value: ""}, "Prior period"),
+                        m("option", {value: "fixed"}, "A number"),
+                        m("option", {value: "percent"}, "A percentage")
+                    ]),
+                    m("input", {
+                        disabled: !isAdmin || !one.basis,
+                        placeholder: (
+                            one.basis
+                            ? hint
+                            : ""
+                        ),
+                        step: "any",
+                        type: "number",
+                        oninput: (e) => change(kpi, "amount", e.target.value),
+                        value: (
+                            one.basis
+                            ? one.amount
+                            : ""
+                        )
+                    }),
+                    m("select", {
+                        disabled: !isAdmin,
+                        onchange: (e) => change(kpi, "better", e.target.value),
+                        title: "Which way is good for this metric",
+                        value: one.better || kpi.better || "higher"
+                    }, [
+                        m("option", {value: "higher"}, "Higher is better"),
+                        m("option", {value: "lower"}, "Lower is better")
+                    ])
+                ]);
+            }
+
+            return m("div", {class: "pure-form"}, [
+                m("input", {
+                    class: "fb-dialog-picker-filter",
+                    type: "search",
+                    placeholder: "Filter metrics",
+                    oninput: (e) => targetsFilter(e.target.value),
+                    value: targetsFilter()
+                }),
+                m("div", {class: "fb-target-list"}, (
+                    shown.length
+                    ? shown.map(row)
+                    : m("div", {
+                        class: "fb-dialog-picker-none"
+                    }, "No metric matches that.")
+                )),
+                m("div", {
+                    class: "fb-dialog-note"
+                }, (
+                    isAdmin
+                    ? (
+                        "A metric with no target is judged against its " +
+                        "prior period. A percentage is of that prior " +
+                        "period, and is negative where lower is better."
+                    )
+                    : (
+                        "Targets are what every board showing a metric " +
+                        "judges it by, so only an administrator can " +
+                        "change them."
+                    )
+                ))
+            ]);
+        };
+        targetsDlg.onOk(function () {
+            let save = catalog.store().global().dashboardSaveTargets;
+            let stored = catalog.store().global().dashboardTargets;
+            let held = (
+                stored
+                ? stored()
+                : {}
+            );
+            let draft = targetsDraft();
+            let changes = [];
+
+            if (!save || !isAdmin) {
+                return;
+            }
+
+            Object.keys(draft).forEach(function (key) {
+                let one = draft[key];
+                let was = held[key];
+                let basis = (
+                    (one.basis && one.amount !== "")
+                    ? one.basis
+                    : ""
+                );
+
+                if (!basis) {
+                    if (was) {
+                        changes.push({metric: key});
+                    }
+                    return;
+                }
+                if (
+                    was &&
+                    was.basis === basis &&
+                    Number(was.amount) === Number(one.amount) &&
+                    (was.better || "") === (one.better || "")
+                ) {
+                    return;
+                }
+                changes.push({
+                    amount: Number(one.amount),
+                    basis,
+                    better: one.better || null,
+                    metric: key
+                });
+            });
+
+            save(changes).catch(function (err) {
+                targetsErrDlg.message(err.message);
+                targetsErrDlg.show();
+            });
+        });
+        targetsDlg.buttonOk().isDisabled = () => !isAdmin;
+        targetsDlg.buttonOk().title = function () {
+            if (!isAdmin) {
+                return "Only an administrator can change targets";
+            }
+        };
+
+        /*
+            View model for saving the board's arrangement. The error
+            dialog is its own, in the idiom of the navigation category
+            dialogs above: a save that the service refused -- somebody
+            else's layout, most often -- has to say so without the
+            arrangement being lost behind a closed dialog.
+        */
+        saveLayoutErrDlg = viewModels.dialog({
+            icon: "error",
+            title: "Error"
+        });
+        saveLayoutDlg = viewModels.dialog({
+            icon: "bookmark_add",
+            title: "Save dashboard layout"
+        });
+        saveLayoutDlg.content = function () {
+            return m("div", {
+                class: "pure-form pure-form-aligned"
+            }, [
+                m("div", {
+                    class: "pure-control-group"
+                }, [
+                    m("label", {
+                        for: layoutNameId
+                    }, "Name:"),
+                    m("input", {
+                        id: layoutNameId,
+                        autocomplete: "off",
+                        oninput: (e) => layoutName(e.target.value),
+                        value: layoutName()
+                    })
+                ]),
+                (
+                    /*
+                        The default is a decision about the instance --
+                        what everyone without a preference sees -- so
+                        only an administrator is offered it. The server
+                        enforces the same rule; this just keeps the
+                        dialog from offering what it would then refuse.
+                    */
+                    canAdminister
+                    ? m("div", {
+                        class: "pure-control-group"
+                    }, [
+                        m("label", {
+                            for: layoutDefaultId
+                        }, "Default:"),
+                        m("input", {
+                            id: layoutDefaultId,
+                            type: "checkbox",
+                            checked: layoutIsDefault(),
+                            onchange: (e) => layoutIsDefault(e.target.checked)
+                        })
+                    ])
+                    : null
+                ),
+                m("div", {
+                    class: "fb-dialog-note"
+                }, (
+                    canAdminister
+                    ? (
+                        "The default layout is what anyone who has not " +
+                        "chosen one sees. Saving under a new name " +
+                        "leaves the old layout alone."
+                    )
+                    : (
+                        "Saving under a new name leaves the old layout " +
+                        "alone. Everyone can choose any saved layout; " +
+                        "an administrator picks which one people start " +
+                        "on."
+                    )
+                ))
+            ]);
+        };
+        saveLayoutDlg.onOk(function () {
+            let save = catalog.store().global().dashboardSaveLayout;
+            let listed = catalog.store().global().dashboardLayouts;
+            let rows = (
+                listed
+                ? listed()
+                : []
+            );
+            let existing = rows.find(
+                (row) => row.name === layoutName().trim()
+            );
+
+            if (!save) {
+                return;
+            }
+            save({
+                /*
+                    A non-administrator echoes the flag as it stands:
+                    sending false for a layout an administrator made
+                    the default would read as demoting it, which is
+                    not theirs to do and would be refused.
+                */
+                isDefault: (
+                    canAdminister
+                    ? layoutIsDefault()
+                    : Boolean(existing && existing.isDefault)
+                ),
+                name: layoutName().trim()
+            }).catch(function (err) {
+                saveLayoutErrDlg.message(err.message);
+                saveLayoutErrDlg.show();
+            });
+        });
+        saveLayoutDlg.buttonOk().isDisabled = () => !layoutName().trim();
+        saveLayoutDlg.buttonOk().title = function () {
+            if (!layoutName().trim()) {
+                return "A layout needs a name";
+            }
+        };
+
+        asOfDlg.onOk(function () {
+            let setAsOf = catalog.store().global().dashboardSetAsOf;
+
+            if (setAsOf) {
+                setAsOf(asOfPending() || null);
+            }
+        });
+
         // View model for maintaining navigation categories -- the
         // ribbon's tabs. Dropping down from the top of the viewport
         // started here and is now how every dialog behaves, so there
@@ -1549,6 +3624,47 @@ function initApp() {
             "navCategoryErrDlg",
             navCategoryErrDlg
         );
+        catalog.register(
+            "global",
+            "asOfDlg",
+            asOfDlg
+        );
+        catalog.register(
+            "global",
+            "saveLayoutDlg",
+            saveLayoutDlg
+        );
+        catalog.register(
+            "global",
+            "saveLayoutErrDlg",
+            saveLayoutErrDlg
+        );
+        catalog.register(
+            "global",
+            "addTileDlg",
+            addTileDlg
+        );
+        catalog.register(
+            "global",
+            "addTileErrDlg",
+            addTileErrDlg
+        );
+        catalog.register("global", "dashboardEditTile", openTileEditor);
+        catalog.register("global", "appZoom", appZoom);
+        catalog.register("global", "profileValue", profileValue);
+        catalog.register("global", "profileSave", profileSave);
+        catalog.register(
+            "global",
+            "deleteLayoutDlg",
+            deleteLayoutDlg
+        );
+        catalog.register(
+            "global",
+            "deleteLayoutErrDlg",
+            deleteLayoutErrDlg
+        );
+        catalog.register("global", "targetsDlg", targetsDlg);
+        catalog.register("global", "targetsErrDlg", targetsErrDlg);
 
         m.route(document.body, "/home", routes);
     });
@@ -1560,6 +3676,7 @@ async function start() {
         return;
     }
 
+    applyStoredZoom();
     initPromises();
     await Promise.all([
         loadCatalog,
@@ -1569,6 +3686,7 @@ async function start() {
         loadWorkbooks,
         loadNavigationCategories
     ]);
+    applyProfileZoom();
     initApp();
 }
 
@@ -1628,7 +3746,7 @@ if (window.location.pathname.slice(
 
             // Connection opened
             evsubscr.onopen = function () {
-                evsubscr.send(edata.eventKey);
+                evsubscr.send(catalog.eventKey());
                 connectionMonitor.setSocketUp(true);
             };
 
@@ -1680,12 +3798,15 @@ if (window.location.pathname.slice(
             // Initiate event listener with key on sign in
             f.state().resolve("/SignedIn").enter(listen);
             f.state().resolve("/SignedIn/Ready").enter(function () {
-                if (!hash || (hash === "/sign-in")) {
-                    m.route.set("/home");
-                    window.history.go(0);
-                    return;
-                }
-                m.route.set(hash);
+                // Wait for start() rather than reload to finish it: a
+                // reload loaded every catalog, form and module twice.
+                starting.then(function () {
+                    if (!hash || (hash === "/sign-in")) {
+                        m.route.set("/home");
+                        return;
+                    }
+                    m.route.set(hash);
+                });
             });
 
             if (resp.data.authorized) {
@@ -1694,8 +3815,8 @@ if (window.location.pathname.slice(
                 await start();
             } else {
                 m.route(document.body, "/sign-in", routes);
-                f.state().resolve("/SignedIn").enter(async function () {
-                    await start();
+                f.state().resolve("/SignedIn").enter(function () {
+                    starting = start();
                 });
                 f.state().send("signIn");
             }

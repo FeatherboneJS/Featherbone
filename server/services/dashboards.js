@@ -1,0 +1,486 @@
+/*
+    Framework for building object relational database apps
+    Copyright (C) 2027  Featherbone LLC
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+/*jslint node*/
+/**
+    @module Dashboards
+*/
+(function (exports) {
+    "use strict";
+
+    const {Tools} = require("./tools");
+    const f = require("../../common/core");
+
+    const tools = new Tools();
+
+    /*
+        A layout is one JSON document, handled whole. It is shaped like a
+        workbook rather than made a feather for the reason workbooks were:
+        the structure is deep and gets deeper as tile types arrive with
+        their own options and their own editing, and nobody is ever going
+        to maintain one as rows in a table (John, Oct 2026).
+
+        This table holds the layouts that are SHARED -- shipped by a
+        package, or saved by somebody for everyone to use. Whichever
+        layout a given person has chosen, and any private adjustments to
+        it, belong in `$profiles` beside their workbook column widths,
+        so that one person rearranging their board does not rearrange
+        everybody's.
+    */
+    const BASES = ["fixed", "percent"];
+    const DIRECTIONS = ["higher", "lower"];
+    const COLUMNS = (
+        "id, name, label, description, module, sequence, " +
+        "is_default AS \"isDefault\", config, " +
+        "created_by AS \"createdBy\""
+    );
+
+    /**
+        Dashboard layouts: the arrangement of tiles on the Home tab.
+
+        @class Dashboards
+        @constructor
+        @namespace Services
+    */
+    exports.Dashboards = function () {
+        let that = {};
+
+        /**
+            Resolves to every layout, in presentation order.
+
+            Layouts are readable by everyone on the instance. They
+            describe an arrangement, not data: what a tile is allowed to
+            show is settled when the tile loads, against the viewer's own
+            permissions, so a layout naming a measure somebody may not see
+            yields an empty tile rather than a leak.
+
+            @method getDashboards
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @return {Promise}
+        */
+        that.getDashboards = async function (obj) {
+            let sql = (
+                "SELECT " + COLUMNS + " FROM \"$dashboard\" " +
+                "WHERE NOT is_deleted " +
+                "ORDER BY sequence, name;"
+            );
+            let resp = await obj.client.query(sql);
+
+            return resp.rows;
+        };
+
+        /**
+            Resolves to one layout by name, or false where there is none.
+
+            @method getDashboard
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @param {Object} payload.data Request data
+            @param {String} payload.data.name Layout name
+            @return {Promise}
+        */
+        that.getDashboard = async function (obj) {
+            let data = obj.data || {};
+            let name = data.name;
+            let sql = (
+                "SELECT " + COLUMNS + " FROM \"$dashboard\" " +
+                "WHERE name = $1 AND NOT is_deleted;"
+            );
+            let resp = await obj.client.query(sql, [name]);
+
+            if (!resp.rows.length) {
+                return false;
+            }
+            return resp.rows[0];
+        };
+
+        /**
+            Creates or replaces a layout, keyed on its name.
+
+            Anyone may create one: a layout is somebody's own arrangement
+            offered to the rest of the instance, and needing an
+            administrator to publish one would mean nobody ever did.
+            Changing or removing one is held to its author or a super
+            user, so a shared layout cannot be quietly rewritten under the
+            people using it.
+
+            The default flag is governed separately, because it is not a
+            property of a layout but a decision about the instance --
+            what everyone who has expressed no preference sees:
+
+            - Only a super user may change which layout is the default.
+            - A package (`fromPackage`) claims the default only when no
+              default exists, or when the default is already its own
+              layout. So a fresh install arrives with a board, and a
+              reinstall can never override what an administrator chose.
+              The HTTP route strips `fromPackage`, so only the installer
+              can speak with a package's voice.
+
+            @method saveDashboard
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @param {String} payload.user User name
+            @param {Object} payload.data Layout
+            @return {Promise}
+        */
+        that.saveDashboard = async function (obj) {
+            let spec = obj.data || {};
+            let theClient = obj.client;
+            let name = spec.name;
+            let user = theClient.currentUser();
+            let wantDefault = Boolean(spec.isDefault);
+            let hadDefault = false;
+            let standing;
+            let found;
+            let isSuper;
+            let err;
+            let sql;
+
+            if (!name) {
+                err = new Error("Layout requires a name.");
+                err.statusCode = 400;
+                throw err;
+            }
+
+            found = await that.getDashboard({
+                client: theClient,
+                data: {name}
+            });
+            hadDefault = Boolean(found && found.isDefault);
+
+            if (spec.fromPackage) {
+                /*
+                    A package's claim on the default is conditional, not
+                    an instruction: honoured only where there is nothing
+                    to override.
+                */
+                if (wantDefault && !hadDefault) {
+                    standing = await theClient.query(
+                        "SELECT name FROM \"$dashboard\" " +
+                        "WHERE is_default AND NOT is_deleted " +
+                        "AND name <> $1;",
+                        [name]
+                    );
+                    if (standing.rows.length) {
+                        wantDefault = false;
+                    }
+                }
+            } else if (wantDefault !== hadDefault) {
+                isSuper = await tools.isSuperUser({
+                    client: theClient,
+                    user: obj.user
+                });
+                if (!isSuper) {
+                    err = new Error(
+                        "The default layout is what everyone who has " +
+                        "not chosen one sees, so changing it takes an " +
+                        "administrator."
+                    );
+                    err.statusCode = 401;
+                    throw err;
+                }
+            }
+
+            if (found) {
+                if (isSuper === undefined) {
+                    isSuper = await tools.isSuperUser({
+                        client: theClient,
+                        user: obj.user
+                    });
+                }
+
+                if (found.createdBy !== user && !isSuper) {
+                    err = new Error(
+                        "Layout \"" + name + "\" belongs to " +
+                        found.createdBy + ". Save it under another name " +
+                        "to keep your own version."
+                    );
+                    err.statusCode = 401;
+                    throw err;
+                }
+
+                sql = (
+                    "UPDATE \"$dashboard\" SET " +
+                    "updated_by = $2, updated = now(), " +
+                    "label = $3, description = $4, module = $5, " +
+                    "sequence = $6, is_default = $7, config = $8 " +
+                    "WHERE name = $1;"
+                );
+                await theClient.query(sql, [
+                    name,
+                    user,
+                    spec.label || found.label,
+                    spec.description || found.description,
+                    spec.module || found.module,
+                    spec.sequence || found.sequence || 0,
+                    wantDefault,
+                    JSON.stringify(spec.config || found.config || {})
+                ]);
+
+                if (wantDefault) {
+                    await that.clearOtherDefaults({
+                        client: theClient,
+                        data: {name}
+                    });
+                }
+                return found.id;
+            }
+
+            // A deleted (flagged) layout still holds the unique name.
+            await theClient.query(
+                "DELETE FROM \"$dashboard\" WHERE name = $1 AND is_deleted;",
+                [name]
+            );
+
+            sql = (
+                "INSERT INTO \"$dashboard\" (" +
+                "_pk, id, name, label, description, module, sequence, " +
+                "is_default, config, created_by, updated_by, " +
+                "created, updated, is_deleted) " +
+                "VALUES (nextval('object__pk_seq'), " +
+                "$1, $2, $3, $4, $5, $6, $7, $8, $9, $9, " +
+                "now(), now(), false);"
+            );
+            spec.id = f.createId();
+            await theClient.query(sql, [
+                spec.id,
+                name,
+                spec.label || name,
+                spec.description || "",
+                spec.module || "",
+                spec.sequence || 0,
+                wantDefault,
+                JSON.stringify(spec.config || {}),
+                user
+            ]);
+
+            if (wantDefault) {
+                await that.clearOtherDefaults({
+                    client: theClient,
+                    data: {name}
+                });
+            }
+            return spec.id;
+        };
+
+        /**
+            Leaves exactly one layout flagged as the default.
+
+            Two defaults is not a state anybody can resolve by looking at
+            the board, so the flag is treated as a switch rather than a
+            property: setting it on one layout takes it off the rest.
+
+            @method clearOtherDefaults
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @param {Object} payload.data Request data
+            @param {String} payload.data.name The layout keeping the flag
+            @return {Promise}
+        */
+        that.clearOtherDefaults = async function (obj) {
+            let data = obj.data || {};
+            let sql = (
+                "UPDATE \"$dashboard\" SET is_default = false " +
+                "WHERE name <> $1 AND is_default;"
+            );
+
+            await obj.client.query(sql, [data.name]);
+        };
+
+        /**
+            Removes a layout. Its author or a super user only.
+
+            @method deleteDashboard
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @param {String} payload.user User name
+            @param {Object} payload.data Request data
+            @param {String} payload.data.name Layout name
+            @return {Promise}
+        */
+        that.deleteDashboard = async function (obj) {
+            let theClient = obj.client;
+            let data = obj.data || {};
+            let name = data.name;
+            let user = theClient.currentUser();
+            let found = await that.getDashboard({
+                client: theClient,
+                data: {name}
+            });
+            let isSuper;
+            let err;
+
+            if (!found) {
+                return false;
+            }
+
+            isSuper = await tools.isSuperUser({
+                client: theClient,
+                user: obj.user
+            });
+
+            if (found.createdBy !== user && !isSuper) {
+                err = new Error(
+                    "Layout \"" + name + "\" belongs to " +
+                    found.createdBy + "."
+                );
+                err.statusCode = 401;
+                throw err;
+            }
+
+            await theClient.query(
+                "UPDATE \"$dashboard\" SET is_deleted = true, " +
+                "updated_by = $2, updated = now() WHERE name = $1;",
+                [name, user]
+            );
+
+            return true;
+        };
+
+        /**
+            Resolves to every stored metric target. Readable by all.
+
+            @method getDashboardTargets
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @return {Promise}
+        */
+        that.getDashboardTargets = async function (obj) {
+            let resp = await obj.client.query(
+                "SELECT metric, basis, amount, better, " +
+                "updated_by AS \"updatedBy\", updated " +
+                "FROM \"$dashboard_target\" ORDER BY metric;"
+            );
+
+            return resp.rows.map(function (row) {
+                row.amount = Number(row.amount);
+                return row;
+            });
+        };
+
+        async function mustBeSuper(obj, doing) {
+            let isSuper = await tools.isSuperUser({
+                client: obj.client,
+                user: obj.user
+            });
+            let err;
+
+            if (!isSuper) {
+                err = new Error(
+                    "A metric's target is what everyone's board judges " +
+                    "it against, so " + doing + " takes an administrator."
+                );
+                err.statusCode = 401;
+                throw err;
+            }
+        }
+
+        /**
+            Sets one metric's target. Super users only.
+
+            @method saveDashboardTarget
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @param {String} payload.user User name
+            @param {Object} payload.data Target
+            @param {String} payload.data.metric Metric key
+            @param {String} payload.data.basis "fixed" or "percent"
+            @param {Number} payload.data.amount Target, or signed percent
+            @param {String} [payload.data.better] "higher" or "lower"
+            @return {Promise}
+        */
+        that.saveDashboardTarget = async function (obj) {
+            let data = obj.data || {};
+            let theClient = obj.client;
+            let user = theClient.currentUser();
+            let amount = Number(data.amount);
+            let better = data.better || null;
+            let err;
+
+            function refuse(message) {
+                err = new Error(message);
+                err.statusCode = 400;
+                throw err;
+            }
+
+            if (!data.metric) {
+                refuse("A target needs the metric it is for.");
+            }
+            if (BASES.indexOf(data.basis) === -1) {
+                refuse(
+                    "A target is either a number (\"fixed\") or a " +
+                    "percentage of the comparison (\"percent\")."
+                );
+            }
+            if (
+                data.amount === null ||
+                data.amount === undefined ||
+                data.amount === "" ||
+                !Number.isFinite(amount)
+            ) {
+                refuse("A target needs an amount.");
+            }
+            if (better !== null && DIRECTIONS.indexOf(better) === -1) {
+                refuse("Better is \"higher\" or \"lower\".");
+            }
+
+            await mustBeSuper(obj, "setting one");
+
+            await theClient.query(
+                "INSERT INTO \"$dashboard_target\" (" +
+                "_pk, id, metric, basis, amount, better, created_by, " +
+                "updated_by, created, updated, is_deleted) " +
+                "VALUES (nextval('object__pk_seq'), $1, $2, $3, $4, $5, " +
+                "$6, $6, now(), now(), false) " +
+                "ON CONFLICT (metric) DO UPDATE SET basis = $3, " +
+                "amount = $4, better = $5, updated_by = $6, " +
+                "updated = now();",
+                [f.createId(), data.metric, data.basis, amount, better, user]
+            );
+
+            return true;
+        };
+
+        /**
+            Removes one metric's target. Super users only.
+
+            @method deleteDashboardTarget
+            @param {Object} payload Request payload
+            @param {Client} payload.client Database client
+            @param {String} payload.user User name
+            @param {Object} payload.data Request data
+            @param {String} payload.data.metric Metric key
+            @return {Promise}
+        */
+        that.deleteDashboardTarget = async function (obj) {
+            let data = obj.data || {};
+            let resp;
+
+            await mustBeSuper(obj, "removing one");
+            resp = await obj.client.query(
+                "DELETE FROM \"$dashboard_target\" WHERE metric = $1;",
+                [data.metric]
+            );
+
+            return resp.rowCount > 0;
+        };
+
+        return that;
+    };
+
+}(exports));

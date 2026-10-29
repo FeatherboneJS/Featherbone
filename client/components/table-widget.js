@@ -977,6 +977,19 @@ function createTableFooter(options, col) {
     return fview;
 }
 
+// How much the whole page is drawn larger than its CSS sizes (html's
+// zoom -- see --fb-ui-scale in featherbone.css). 1 where there is none.
+function pageScale() {
+    let scale = parseFloat(
+        window.getComputedStyle(document.documentElement).zoom
+    );
+
+    if (scale > 0) {
+        return scale;
+    }
+    return 1;
+}
+
 // Resize according to surroundings. `vnode` is the scroll box, which
 // holds the header, rows and any totals footer; it's sized so its bottom
 // edge lands where the old separately-scrolled row area's did.
@@ -989,6 +1002,7 @@ function resize(vm, vnode) {
     let tableFooter = document.getElementById(vm.ids().footer);
     let extra = 0;
     let top = e.getBoundingClientRect().top;
+    let scale = pageScale();
     let h;
 
     if (header) {
@@ -1006,14 +1020,19 @@ function resize(vm, vnode) {
         return;
     }
 
+    // innerHeight and the box's top are in real viewport pixels; the
+    // height set below is in the page's own, which html's zoom has
+    // stretched by `scale`. Measuring in the one and assigning in the
+    // other left the box taller than the window, and its sticky totals
+    // footer pinned below the fold.
     if (id) {
         pageFooter = document.getElementById(id);
-        h = window.innerHeight - top;
+        h = (window.innerHeight - top) / scale;
         if (pageFooter) {
             h -= pageFooter.offsetHeight;
         }
     } else {
-        h = window.innerHeight - top - 82;
+        h = (window.innerHeight - top) / scale - 82;
 
         if (h < f.TABLE_MIN_HEIGHT) {
             h = f.TABLE_MIN_HEIGHT;
@@ -1656,8 +1675,29 @@ tableWidget.viewModel = function (options) {
                     props.push(a);
                 }
             });
-            // Exclude calculated columns
-            props = props.filter((p) => fp[p] && !fp[p].isCalculated);
+            /*
+                Exclude calculated columns, and a child's link to its
+                parent when that link lists no properties: the child's
+                view has no column for it then, so a list of child rows
+                filtered by their parent (one inventory snapshot's
+                lines) asked for a column that is not there and got
+                nothing back. A link that does list properties -- a
+                purchase order line's purchaseOrder, a receipt line's
+                purchaseOrderReceipt -- is a column like any other, and
+                leaving it out emptied every list that showed or
+                filtered on it (John, Oct 2026).
+            */
+            props = props.filter(function (p) {
+                let type = fp[p] && fp[p].type;
+
+                return (
+                    fp[p] && !fp[p].isCalculated && !(
+                        typeof type === "object" &&
+                        type.childOf &&
+                        !(type.properties && type.properties.length)
+                    )
+                );
+            });
             if (props.indexOf("id") === -1) {
                 props.unshift("id");
             }
@@ -1707,7 +1747,10 @@ tableWidget.viewModel = function (options) {
                     f.isMoney(prop.format) &&
                     aggregates[i].method !== "COUNT"
                 ) {
-                    val = f.money(val); // Hack, what if mixed currency?
+                    // In base currency: the server totals what each
+                    // value is worth in base (money_base), whatever
+                    // currency the rows are in.
+                    val = f.money(val);
                 }
                 aggs[p] = val;
 
@@ -1879,15 +1922,20 @@ tableWidget.viewModel = function (options) {
             onclick: doExport
         });
 
-        data.push({
-            id: "import",
-            icon: "file_upload",
-            outlined: true,
-            name: "Import",
-            title: "Import data",
-            enabled: true,
-            onclick: doImport
-        });
+        // A list that is a view onto figures rather than a place to work
+        // -- a dashboard drill-down -- offers no way to put data in; see
+        // drill-dialog.js.
+        if (vm.isImportEnabled()) {
+            data.push({
+                id: "import",
+                icon: "file_upload",
+                outlined: true,
+                name: "Import",
+                title: "Import data",
+                enabled: true,
+                onclick: doImport
+            });
+        }
 
         return data;
     }
@@ -1993,6 +2041,15 @@ tableWidget.viewModel = function (options) {
         @param {Boolean} flag
         @return {Boolean}
     */
+    /**
+        Whether Import is offered among the list's actions. Default true.
+
+        @method isImportEnabled
+        @param {Boolean} [flag]
+        @return {Boolean}
+    */
+    vm.isImportEnabled = f.prop(options.isImportEnabled !== false);
+
     vm.isEditModeEnabled = function (...args) {
         let enable = args[0];
         if (enable === false) {

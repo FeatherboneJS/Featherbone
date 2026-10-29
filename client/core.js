@@ -20,6 +20,7 @@
     @module Core
 */
 import createProperty from "./property.js";
+import openHelp from "./help.js";
 import createModel from "./models/model.js";
 import createList from "./models/list.js";
 import catalog from "./models/catalog.js";
@@ -2895,7 +2896,7 @@ appState = State.define(function () {
                     username: context.username,
                     password: context.password
                 }
-            }).then(function (resp) {
+            }).then(async function (resp) {
                 message("");
                 if (resp.confirmUrl) {
                     f.state().send("confirm", {
@@ -2904,6 +2905,14 @@ appState = State.define(function () {
                         response: resp
                     });
                 } else {
+                    // Who signed in, and an event key for the new
+                    // session, as the confirm path does
+                    resp = await f.datasource().request({
+                        method: "POST",
+                        path: "/connect"
+                    });
+                    f.currentUser(resp.data.authorized);
+                    f.catalog().eventKey(resp.data.eventKey);
                     f.state().send("success");
                 }
             }).catch(function (err) {
@@ -2995,6 +3004,7 @@ appState = State.define(function () {
                     path: "/connect"
                 });
                 f.currentUser(resp.data.authorized);
+                f.catalog().eventKey(resp.data.eventKey);
                 message("");
                 f.state().send("success");
             }).catch(function () {
@@ -3030,6 +3040,15 @@ f.State = State;
     @return {String}
 */
 f.version = createProperty();
+/**
+    Show help for a form or a feather, in the pop-out help window
+    (client/help.js, ADR-003).
+
+    @method openHelp
+    @param {Object} [topic] {form, feather}
+    @return {Void}
+*/
+f.openHelp = openHelp;
 f.TABLE_MIN_HEIGHT = 200;
 f.TABLE_COLUMN_WIDTH_DEFAULT = 150;
 

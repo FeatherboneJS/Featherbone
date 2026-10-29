@@ -194,6 +194,17 @@ dialog.viewModel = function (options) {
     */
     vm.title = f.prop(options.title || "");
     /**
+        Whether the title is already written for reading, in which case it
+        is shown as given. A title is otherwise taken for a property path
+        and tidied into a name, which eats the punctuation in a title that
+        quotes data: a drill-down into product ITEM-08 was headed ITEM08.
+
+        @method isTitleLiteral
+        @param {Boolean} flag
+        @return {Boolean}
+    */
+    vm.isTitleLiteral = f.prop(options.isTitleLiteral === true);
+    /**
         @method state
         @param {String} title
         @return {State}
@@ -302,9 +313,17 @@ dialog.component = {
         @method view
         @return {Object} View
     */
-    view: function () {
+    view: function (vnode) {
         let content;
-        let vm = this.viewModel;
+        /*
+            The view model as it is NOW, not as it was when this
+            component was created: oninit runs once, so a caller that
+            swaps in a new view model -- the dashboard, opening a
+            drill-down on a different figure -- would otherwise keep
+            rendering the first one, which by then is closed (John
+            reported a second drill doing nothing, Oct 2026).
+        */
+        let vm = vnode.attrs.viewModel || this.viewModel;
         let ids = vm.ids();
         let header;
         let icon = vm.icon();
@@ -345,10 +364,19 @@ dialog.component = {
         content.unshift(vm.content());
 
         if (vm.icon() || vm.title()) {
+            // Icon and title as ONE array of children rather than two
+            // arguments: as two, the title is a text node sitting beside
+            // an array, and a dialog that changes its own title while
+            // open -- a drill-down naming where it has got to -- kept
+            // showing the title it opened with.
             header = m("h3", {
                 id: ids.header,
                 class: "fb-header"
-            }, [f.icon(icon, iconClass)], vm.title().toName());
+            }, [f.icon(icon, iconClass), (
+                (vm.isTitleLiteral && vm.isTitleLiteral())
+                ? vm.title()
+                : vm.title().toName()
+            )]);
         }
 
         return m("dialog", {

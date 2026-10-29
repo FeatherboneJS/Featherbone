@@ -302,7 +302,7 @@ describe("user accounts", function () {
         });
 
         assert.equal(resp.status, 204);
-        let contact = await admin.read("Employee", u.contactId);
+        let contact = await admin.read(u.contactFeather, u.contactId);
         assert.equal(contact.firstName, "Changed");
         assert.equal(contact.lastName, "Person");
         assert.equal(contact.email, email);
@@ -507,12 +507,7 @@ describe("user accounts", function () {
 
         // server.js doQueryRequest forces isSuper for Form, Module, Role
         // and UserAccount queries
-        it("cannot list all user accounts", {
-            todo: (
-                "defect: POST /data/user-accounts runs as super user for " +
-                "any signed-in user (server.js doQueryRequest)"
-            )
-        }, async function () {
+        it("cannot list all user accounts", async function () {
             let rows = await session.list("UserAccounts", {
                 properties: ["name"]
             });

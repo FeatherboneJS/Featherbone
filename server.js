@@ -37,7 +37,6 @@
     const MagicLoginStrategy = require("passport-magic-login").default;
     const {Config} = require("./server/config");
     const config = new Config();
-    const {Tools} = require("./server/services/tools");
     const {Admin} = require("./server/services/admin");
     const {Notify} = require("./server/services/notify");
     const {SignInLink} = require("./server/services/sign-in-link");
@@ -91,14 +90,23 @@
     }
 
     const check = [
+        "about",
         "admin",
+        "api",
         "currency",
+        "dashboard",
+        "dashboard-target",
+        "dashboard-targets",
+        "dashboards",
         "data",
         "do",
         "feather",
+        "help",
+        "help-topic",
         "module",
         "modules",
         "navigation-categories",
+        "openapi.json",
         "profile",
         "sessions",
         "settings",
@@ -146,12 +154,15 @@
     f.jsonpatch = require("fast-json-patch");
 
     /**
+        The formats are hung on `f` by server/datasource.js, which
+        install.js loads as well, so that a module's code can register
+        its own however the install was started (item 0.11).
+
         @property formats
         @type Object
         @for f
         @final
     */
-    f.formats = new Tools().formats;
 
     let app = express();
     let eventSessions = {};
@@ -1024,6 +1035,14 @@
         doGetMethod("getSettingsDefinition", req, res);
     }
 
+    function doGetDashboard(req, res) {
+        doGetMethod("getDashboard", req, res);
+    }
+
+    function doGetDashboards(req, res) {
+        doGetMethod("getDashboards", req, res);
+    }
+
     function doGetWorkbook(req, res) {
         doGetMethod("getWorkbook", req, res);
     }
@@ -1141,6 +1160,90 @@
             datasource against the request's own catalog, where it
             guards every database instead of one.
         */
+    }
+
+    /*
+        The layout's name comes from the route, not the body, so a
+        request cannot quietly save over a different layout than the
+        one it addressed.
+    */
+    function doSaveDashboard(req, res) {
+        let spec = Object.assign({}, req.body, {name: req.params.name});
+
+        // Only the installer may speak with a package's voice; see
+        // saveDashboard on why a package's default claim is weaker
+        // than an administrator's.
+        delete spec.fromPackage;
+        let payload = {
+            method: "PUT",
+            name: "saveDashboard",
+            user: req.user.name,
+            data: spec,
+            tenant: req.tenant
+        };
+
+        logger.verbose(loggable(payload));
+        datasource.request(payload).then(
+            respond.bind(res)
+        ).catch(
+            error.bind(res)
+        );
+    }
+
+    function doGetDashboardTargets(req, res) {
+        doGetMethod("getDashboardTargets", req, res);
+    }
+
+    // Metric from the route, not the body.
+    function doSaveDashboardTarget(req, res) {
+        let payload = {
+            method: "PUT",
+            name: "saveDashboardTarget",
+            user: req.user.name,
+            data: Object.assign({}, req.body, {metric: req.params.metric}),
+            tenant: req.tenant
+        };
+
+        logger.verbose(loggable(payload));
+        datasource.request(payload).then(
+            respond.bind(res)
+        ).catch(
+            error.bind(res)
+        );
+    }
+
+    function doDeleteDashboardTarget(req, res) {
+        let payload = {
+            method: "DELETE",
+            name: "deleteDashboardTarget",
+            user: req.user.name,
+            data: {metric: req.params.metric},
+            tenant: req.tenant
+        };
+
+        logger.verbose(loggable(payload));
+        datasource.request(payload).then(
+            respond.bind(res)
+        ).catch(
+            error.bind(res)
+        );
+    }
+
+    function doDeleteDashboard(req, res) {
+        let payload = {
+            method: "DELETE",
+            name: "deleteDashboard",
+            user: req.user.name,
+            data: {name: req.params.name},
+            tenant: req.tenant
+        };
+
+        logger.verbose(loggable(payload));
+        datasource.request(payload).then(
+            respond.bind(res)
+        ).catch(
+            error.bind(res)
+        );
     }
 
     function doSaveWorkbook(req, res) {
@@ -1293,12 +1396,18 @@
     function doPackageModule(req, res) {
         let name = req.params.name;
         let username = req.user.name;
+        let options = {
+            includeDashboard: !(
+                req.body && req.body.includeDashboard === false
+            )
+        };
 
         logger.verbose("Package " + name);
         datasource.package(
             name,
             username,
-            req.tenant
+            req.tenant,
+            options
         ).then(
             respond.bind(res)
         ).catch(
@@ -1766,6 +1875,92 @@
             res.write(resp);
             res.end();
         });
+    }
+
+    /*
+        The help window (ADR-003): one page, which asks for a topic and
+        renders the module's Markdown itself. Served from the checkout
+        like index.html, and behind the session like the rest of an
+        instance.
+    */
+    function doGetHelpPage(ignore, res) {
+        fs.readFile("./help.html", function (err, resp) {
+            if (err) {
+                error.bind(res)(new Error(err));
+                return;
+            }
+            res.writeHeader(200, {"Content-Type": "text/html"});
+            res.write(resp);
+            res.end();
+        });
+    }
+
+    // Which page answers for a form or a feather, and the customer's own
+    function doGetHelpTopic(req, res) {
+        let payload = {
+            data: {
+                feather: req.query.feather,
+                form: req.query.form
+            },
+            method: "GET",
+            name: "getHelpTopic",
+            tenant: req.tenant,
+            user: req.user.name
+        };
+
+        logger.verbose(loggable(payload));
+        datasource.request(payload).then(respond.bind(res)).catch(
+            error.bind(res)
+        );
+    }
+
+    /*
+        The REST API reference: one page that has Redoc render the
+        instance's own OpenAPI document. Served like the help window.
+    */
+    function doGetApiPage(ignore, res) {
+        fs.readFile("./api.html", function (err, resp) {
+            if (err) {
+                error.bind(res)(new Error(err));
+                return;
+            }
+            res.writeHeader(200, {"Content-Type": "text/html"});
+            res.write(resp);
+            res.end();
+        });
+    }
+
+    // Framework, module and infrastructure versions for About
+    function doGetAbout(req, res) {
+        doGetMethod("getAbout", req, res);
+    }
+
+    // The instance's OpenAPI document: core, its feathers, its modules
+    function doGetOpenApi(req, res) {
+        doGetMethod("getOpenApi", req, res);
+    }
+
+    /*
+        A help file of the module version this database deployed. The
+        service refuses a path that leaves the module's help folder.
+    */
+    function doGetHelpFile(req, res) {
+        let payload = {
+            data: {
+                module: req.params.module,
+                path: req.params[0]
+            },
+            method: "GET",
+            name: "getHelpFile",
+            tenant: req.tenant,
+            user: req.user.name
+        };
+
+        logger.verbose(loggable(payload));
+        datasource.request(payload).then(function (resp) {
+            res.type(resp.type);
+            res.sendFile(resp.file);
+        }).catch(error.bind(res));
     }
 
     /*
@@ -3373,7 +3568,6 @@
     ];
 
     const files = [
-        "/api.json",
         "/index.html",
         "/media/featherbone.png",
         "/files/logo.jpg",
@@ -3383,8 +3577,10 @@
         "/node_modules/event-source-polyfill/src/eventsource.js",
         "/node_modules/fast-json-patch/dist/fast-json-patch.js",
         "/node_modules/fast-json-patch/dist/fast-json-patch.min.js",
+        "/node_modules/marked/lib/marked.umd.js",
         "/node_modules/mithril/mithril.js",
         "/node_modules/mithril/mithril.min.js",
+        "/node_modules/redoc/bundles/redoc.standalone.js",
         "/node_modules/qs/dist/qs.js",
         "/node_modules/purecss/build/pure-min.css",
         "/node_modules/purecss/build/grids-responsive-min.css",
@@ -4316,6 +4512,14 @@
             "/:db/admin/identity/platform-admin",
             doAdmin("setPlatformAdmin")
         );
+        dbRouter.post(
+            "/:db/admin/identity/roles",
+            doAdmin("identityRoles")
+        );
+        dbRouter.post(
+            "/:db/admin/identity/role",
+            doAdmin("setRoleMembership")
+        );
         dbRouter.post("/:db/admin/grant", doAdmin("setGrant"));
         dbRouter.get("/:db/admin/instances", doAdmin("instanceOverview"));
         dbRouter.post(
@@ -4394,6 +4598,12 @@
         dbRouter.post("/:db/module/package/:name", doPackageModule);
         dbRouter.post("/:db/module/install/:query", doInstall);
         dbRouter.post("/:db/do/upgrade/:query", doUpgrade);
+        dbRouter.get("/:db/help", doGetHelpPage);
+        dbRouter.get("/:db/help-topic", doGetHelpTopic);
+        dbRouter.get("/:db/help/:module/*", doGetHelpFile);
+        dbRouter.get("/:db/about", doGetAbout);
+        dbRouter.get("/:db/api", doGetApiPage);
+        dbRouter.get("/:db/openapi.json", doGetOpenApi);
         dbRouter.get("/:db/profile", doGetProfile);
         dbRouter.put("/:db/profile", doPutProfile);
         dbRouter.patch("/:db/profile", doPatchProfile);
@@ -4403,6 +4613,16 @@
         dbRouter.get(
             "/:db/settings/is-authorized/:name",
             doSettingIsAuthorized
+        );
+        dbRouter.get("/:db/dashboards", doGetDashboards);
+        dbRouter.get("/:db/dashboard/:name", doGetDashboard);
+        dbRouter.put("/:db/dashboard/:name", doSaveDashboard);
+        dbRouter.delete("/:db/dashboard/:name", doDeleteDashboard);
+        dbRouter.get("/:db/dashboard-targets", doGetDashboardTargets);
+        dbRouter.put("/:db/dashboard-target/:metric", doSaveDashboardTarget);
+        dbRouter.delete(
+            "/:db/dashboard-target/:metric",
+            doDeleteDashboardTarget
         );
         dbRouter.get("/:db/workbooks", doGetWorkbooks);
         dbRouter.get(

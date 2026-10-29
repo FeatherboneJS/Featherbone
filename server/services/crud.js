@@ -881,12 +881,47 @@
             let feather;
             let agg;
 
+            /*
+                A total of money is a total in the base currency. A list
+                asks for `<money>.amount`, which is the amount in each
+                row's own currency; adding those up across rows in
+                different currencies gives a number in no currency at
+                all, which the footer then labels as base. So the total
+                is taken of what each value is worth in base instead --
+                money_base (scripts/money-functions.js) -- which for a
+                list in one currency is the same number (John, Oct
+                2026).
+            */
+            function isMoneyAmount(attr) {
+                let parts = attr.split(".");
+                let fp = feather.properties[parts[0]];
+
+                return (
+                    parts.length === 2 &&
+                    parts[1] === "amount" &&
+                    Boolean(fp) &&
+                    Boolean(formats[fp.format]) &&
+                    formats[fp.format].isMoney === true
+                );
+            }
+
             function toCols(agg) {
                 let attr = agg.property;
-                let prop = tools.resolvePath(agg.property, tokens);
-                let ret = agg.method.toUpperCase() + "(" + prop + ")";
+                let prop;
+                let ret;
                 let idx = attr.indexOf(".");
                 let comp;
+
+                if (
+                    agg.method.toUpperCase() !== "COUNT" &&
+                    isMoneyAmount(attr)
+                ) {
+                    tokens.push(attr.slice(0, idx).toSnakeCase());
+                    prop = "money_base(%I)";
+                } else {
+                    prop = tools.resolvePath(agg.property, tokens);
+                }
+                ret = agg.method.toUpperCase() + "(" + prop + ")";
 
                 if (idx === -1) {
                     subt.push(attr.toSnakeCase());
@@ -1054,7 +1089,9 @@
                     oldRec = resp;
 
                     if (!oldRec) {
-                        reject("Record " + obj.id + " not found.");
+                        let err = new Error("Record " + obj.id + " not found.");
+                        err.statusCode = 404;
+                        reject(err);
                         return;
                     }
 
@@ -1960,7 +1997,9 @@
                     sql = sql.split(KEY_PARAM).join("$2");
                     params.push(db.cryptoKey());
                 }
-                result = await theClient.query(sql, params);
+                result = await theClient.query(
+                    tools.prepared(theClient, sql, params)
+                );
                 result = mapKeys(result.rows[0]);
                 if (obj.sanitize !== false) {
                     result = tools.sanitize(result);
@@ -2007,7 +2046,9 @@
                     params.push(db.cryptoKey());
                     sql = sql.split(KEY_PARAM).join("$" + params.length);
                 }
-                result = await theClient.query(sql, params);
+                result = await theClient.query(
+                    tools.prepared(theClient, sql, params)
+                );
                 result = tools.sanitize(result.rows.map(mapKeys));
 
                 // Handle subscription
@@ -2074,7 +2115,6 @@
             let params = [];
             let ary = [];
             let clen = 0;
-            let children = [];
             let p = 1;
             let n = 0;
             let theClient = obj.client;
@@ -2496,12 +2536,37 @@
                     }
                 }
 
-                // Done, move on
-                // Execute child changes first so all captured in any
-                // notification
-                children = doList.map(
-                    (item) => item.func(item.payload, true)
-                );
+                /*
+                    Child changes before the parent's own update, so a
+                    notification carries all of it.
+
+                    One at a time, and in the order they were listed,
+                    which is every delete before any insert. They were
+                    started together and awaited as a group: they share
+                    this connection, so nothing ran in parallel anyway
+                    -- they only interleaved, in whatever order their
+                    awaits happened to fall, which is also what
+                    node-postgres warns about ("client.query() when the
+                    client is already executing a query").
+
+                    It matters since item 2.6 put a unique index behind
+                    a natural key. A child whose key is derived rather
+                    than carried -- a work order operation is
+                    `<order number>#<sequence>` -- is replaced by a row
+                    with a new id and the same key, and the insert
+                    reaching the database before the delete it replaces
+                    is refused: re-exploding a work order answered
+                    `duplicate key value violates unique constraint
+                    "work_order_operation_index_number"`. The end state
+                    was always legal; only the order within the save
+                    was not.
+                */
+                let at = 0;
+
+                while (at < doList.length) {
+                    await doList[at].func(doList[at].payload, true);
+                    at += 1;
+                }
 
                 // Execute top level object change
                 sql = (
@@ -2512,7 +2577,6 @@
                 params.push(pk);
                 clen += 1;
 
-                await Promise.all(children);
                 // console.log("SQL", sql);
                 await theClient.query(sql, params);
 
@@ -2613,8 +2677,9 @@
             let resp = await client.query(sql, [id]);
 
             if (!resp.rows.length) {
-                msg = "Record " + id + " not found.";
-                throw new Error(msg);
+                let err = new Error("Record " + id + " not found.");
+                err.statusCode = 404;
+                throw err;
             }
 
             if (

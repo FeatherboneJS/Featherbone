@@ -28,6 +28,7 @@
     const {Config} = require("../config");
     const {Database} = require("../database");
     const {Feathers} = require("./feathers");
+    const {Settings} = require("./settings");
     const config = new Config();
     const fs = require("fs");
     const path = require("path");
@@ -40,6 +41,7 @@
     const api = new API();
     const db = new Database();
     const feathers = new Feathers();
+    const settingsService = new Settings();
 
     function btoa(str) {
         return Buffer.from(str.toString(), "binary").toString("base64");
@@ -90,12 +92,44 @@
                 let processFile;
                 let i = 0;
                 let file;
+                // Work around linter dogma (as server.js does).
+                let copyfile = "copyFile";
+                let existssync = "existsSync";
+                let mkdirsync = "mkdirSync";
                 let filename = path.format({
                     root: "/",
                     dir: pDir,
                     base: MANIFEST
                 });
                 let installedFeathers = false;
+                /*
+                    Views are not made as each feather is saved when a
+                    package is installed under an umbrella: that was
+                    deferred to the end, to stay inside the database's
+                    shared memory. A batch of records for a feather the
+                    install itself created has no view to write through
+                    until then, so it waits here and runs once the
+                    views exist (`runDeferred`).
+
+                    What it looked like: a package that seeded records
+                    into its own new feather failed the whole install
+                    on `relation "_sales_region" does not exist`
+                    (John, Oct 2026). Nothing had done that before;
+                    every batch wrote to a framework feather (Form,
+                    Route, Style), whose views were already there.
+                */
+                /*
+                    The id of the transaction the install opened, so a
+                    failure can tell whether it is still inside it. See
+                    rollback() for why that is worth asking.
+                */
+                let startTxid = null;
+                let viewsDeferred = false;
+                let newFeathers = [];
+                let deferredBatches = [];
+                // Package id -> id already here, from natural-key overwrites,
+                // so later records pointing at the package's id still land.
+                let heldIds = {};
                 let pProcess;
                 let pIsSuper = opts.isSuper;
                 let pSubscr = opts.subscription;
@@ -291,8 +325,72 @@
                     copy, a drop -- waited with it, forever. One failed
                     deployment was enough.
                 */
-                function rollback(err) {
-                    pClient.query("ROLLBACK;", function () {
+                function rollback(reason, opts) {
+                    /*
+                        A caller holding the instance in maintenance
+                        needs to know whether anything was committed
+                        before it lets traffic back on, so the failure
+                        says. Two ways it can say yes:
+
+                        - The install never got as far as its own
+                          COMMIT. The final COMMIT failing counts here
+                          too, since Postgres then rolls the whole
+                          transaction back itself (`commitFailed`).
+                        - But a module's install script can issue its
+                          own COMMIT -- the very bug plan item 2.1
+                          removed from four SupplyChain services -- and
+                          everything before it is then permanent while
+                          everything after runs in autocommit. So this
+                          asks Postgres whether it is still inside the
+                          transaction the install opened. Same id: yes,
+                          nothing has committed. A different id: some
+                          of it has, so it is reported untagged and the
+                          instance stays held. An aborted transaction
+                          refuses the question with an error, which
+                          also means it is the original one.
+                    */
+                    let err = (
+                        (reason && typeof reason === "object")
+                        ? reason
+                        : new Error(String(reason))
+                    );
+
+                    function stillOurs() {
+                        if (opts && opts.commitFailed) {
+                            return Promise.resolve(true);
+                        }
+                        if (startTxid === null) {
+                            // Refused before BEGIN: nothing was opened
+                            return Promise.resolve(true);
+                        }
+                        return pClient.query(
+                            "SELECT txid_current()::text AS t;"
+                        ).then(function (resp) {
+                            return resp.rows[0].t === startTxid;
+                        }).catch(function () {
+                            return true;
+                        });
+                    }
+
+                    stillOurs().then(function (clean) {
+                        err.nothingCommitted = clean;
+                        finishRollback(err);
+                    });
+                }
+
+                function finishRollback(err) {
+
+                    /*
+                        The install is over, failed or not. Only the
+                        finish cleared this, so after any failure the
+                        process went on believing it was installing for
+                        the rest of its life -- and `f.isInstalling()`
+                        is what a module's own code asks before it
+                        starts anything (SupplyChain's ShipEngine
+                        initialiser), so that waited for a restart.
+                    */
+                    isInstalling = false;
+                    pClient.query("ROLLBACK;", async function () {
                         if (conn) {
                             try {
                                 conn.done();
@@ -303,14 +401,87 @@
                         }
                         console.error(err);
                         console.error("Installation failed.");
+
+                        /*
+                            Say so on the install's progress record.
+                            The hooks that mark it failed belong to the
+                            caller's connection and run only when a
+                            request rolls back through crud.rollback;
+                            this ROLLBACK is the installer's own, on
+                            the connection it opened, so the record was
+                            left "processing" for ever and a screen
+                            watching it never learned the install had
+                            ended (John, Oct 2026: "Just said it was
+                            deployed").
+                        */
+                        /*
+                            Two connections, two sets of hooks. The
+                            caller's (reqClient) hold the progress
+                            record. The installer's own (pClient) hold
+                            whatever services registered while doing
+                            the work on it -- the settings service
+                            registers one per settings row it wrote, to
+                            drop that row's process-cache entry if the
+                            write is rolled back. Running only the
+                            caller's left the installer's cache entries
+                            poisoned, which is improvement-plan 6.7:
+                            one failed install making the next fail.
+                        */
+                        let own = pClient.rollbacks || [];
+                        let theirs = reqClient.rollbacks || [];
+                        let hooks = own.concat(theirs);
+
+                        while (hooks.length) {
+                            try {
+                                await hooks.shift()(err);
+                            } catch (hookErr) {
+                                console.error(hookErr);
+                            }
+                        }
+
                         reject(err);
                     });
                 }
 
-                function runBatch(data) {
+                function runBatch(data, after) {
                     let nextItem;
                     let len = data.length;
                     let b = 0;
+
+                    /*
+                        Records for a feather this install created, whose
+                        view is not made yet, wait for the end. Only
+                        those: the same feather being saved again by an
+                        upgrade still has the view it had, and a batch
+                        that already worked keeps its place in the order.
+                    */
+                    let all = data.map((payload) => payload.name);
+                    let names = all.filter((nm, idx) => (
+                        newFeathers.includes(nm) &&
+                        all.indexOf(nm) === idx
+                    ));
+
+                    if (!after && viewsDeferred && names.length) {
+                        pClient.query(
+                            (
+                                "SELECT viewname FROM pg_views " +
+                                "WHERE schemaname = 'public' " +
+                                "  AND viewname = ANY($1);"
+                            ),
+                            [names.map((nm) => "_" + nm.toSnakeCase())]
+                        ).then(function (resp) {
+                            if (resp.rows.length < names.length) {
+                                deferredBatches.push(data);
+                                processFile();
+                                return;
+                            }
+
+                            runBatch(data, processFile);
+                        }).catch(rollback);
+                        return;
+                    }
+
+                    after = after || processFile;
 
                     /*
                         A package's data is the package's to assert.
@@ -344,6 +515,8 @@
                             "replaces it"
                         );
 
+                        heldIds[payload.id] = err.heldBy;
+
                         let again = Object.assign({}, payload, {
                             id: err.heldBy
                         });
@@ -357,12 +530,39 @@
                         ).catch(rollback);
                     }
 
+                    // Relations naming a package id that overwrite() mapped
+                    // to the record already here point at that record.
+                    function heldRefs(value) {
+                        if (Array.isArray(value)) {
+                            return value.map(heldRefs);
+                        }
+                        if (value === null || typeof value !== "object") {
+                            return value;
+                        }
+                        let out = {};
+
+                        Object.keys(value).forEach(function (key) {
+                            out[key] = (
+                                (key === "id" && heldIds[value.id])
+                                ? heldIds[value.id]
+                                : heldRefs(value[key])
+                            );
+                        });
+                        return out;
+                    }
+
                     // Iterate recursively
                     nextItem = function () {
                         let payload;
 
                         if (b < len) {
                             payload = data[b];
+                            if (payload.data) {
+                                payload.data = heldRefs(payload.data);
+                            }
+                            if (heldIds[payload.id]) {
+                                payload.id = heldIds[payload.id];
+                            }
                             payload.user = pUser;
                             payload.client = pClient;
                             b += 1;
@@ -375,7 +575,7 @@
                         }
 
                         // We're done here
-                        processFile();
+                        after();
                     };
 
                     // Start processing
@@ -493,6 +693,8 @@
 
                         // Map feather structure to table structure
                         feathers.forEach(function (feather) {
+                            newFeathers.push(feather.name);
+
                             let keys = Object.keys(feather.properties || {});
                             let auths = feather.authorizations;
                             let props = feather.properties;
@@ -725,9 +927,192 @@
                     ).catch(rollback);
                 }
 
-                function execute(filename) {
-                    let dep = path.resolve(filename);
-                    let exp = require(dep);
+                /*
+                    Dashboard layouts a package carries. Saved one at a
+                    time, in order, because the default flag is a switch
+                    -- setting it on one layout takes it off the rest --
+                    and sending them together would make which one ends
+                    up the default depend on the order they happened to
+                    be written in.
+
+                    A layout the package has shipped before is replaced:
+                    the module owns it, and an upgrade that could not
+                    correct its own board would be worse than one that
+                    can. What a person has CHOSEN is in their profile and
+                    is untouched by this.
+                */
+                function saveDashboards(layouts) {
+                    let queue = layouts.slice();
+
+                    function next() {
+                        let layout = queue.shift();
+
+                        if (!layout) {
+                            processFile();
+                            return;
+                        }
+                        pDatasource.request({
+                            method: "PUT",
+                            name: "saveDashboard",
+                            user: pUser,
+                            client: pClient,
+                            data: Object.assign({}, layout, {
+                                // A package claims the default only
+                                // where no administrator has chosen
+                                // one -- see saveDashboard.
+                                fromPackage: true
+                            })
+                        }, true).then(next).catch(rollback);
+                    }
+
+                    next();
+                }
+
+                /*
+                    The package may carry a sibling file named
+                    "<stem>.png"/".jpg"/".jpeg" (plus ".svg" for an
+                    icon), by convention rather than a manifest.files
+                    entry -- it bears the same relationship to the
+                    package that "module"/"version" do. Returns its
+                    path, or null. Shared by findDashboardImage and
+                    findIconImage below.
+                */
+                function findBrandAsset(stem, extensions) {
+                    let ext = extensions.find(function (candidate) {
+                        return fs[existssync](path.format({
+                            base: stem + candidate,
+                            dir: pDir,
+                            root: "/"
+                        }));
+                    });
+
+                    if (!ext) {
+                        return null;
+                    }
+
+                    return path.format({
+                        base: stem + ext,
+                        dir: pDir,
+                        root: "/"
+                    });
+                }
+
+                function findDashboardImage() {
+                    return findBrandAsset("dashboard", [
+                        ".png", ".jpg", ".jpeg"
+                    ]);
+                }
+
+                // Unlike the wallpaper, an icon is as likely to be
+                // drawn as a vector -- it is small and meant to stay
+                // crisp at ribbon/favicon size.
+                function findIconImage() {
+                    return findBrandAsset("icon", [
+                        ".png", ".jpg", ".jpeg", ".svg"
+                    ]);
+                }
+
+                /*
+                    The manifest's own "title", and the package's sibling
+                    "dashboard"/"icon" images if it has either, merged
+                    into the one shared `brandingSettings` row
+                    (ribbon.js/dashboard.js/main.js read it
+                    client-side). Whichever package last carried any of
+                    the three wins -- the same "package wins" rule as a
+                    natural-key conflict -- and a package naming none of
+                    them leaves whatever is already there alone.
+                */
+                function saveBranding() {
+                    let patch = {};
+
+                    if (manifest.title) {
+                        patch.title = manifest.title;
+                    }
+
+                    // Copies one sibling asset in, if the package has
+                    // one, and records its upload name on patch under
+                    // patchKey -- shared by the dashboard image and
+                    // the icon below, which differ only in which file
+                    // they look for and which setting they land in.
+                    function copyAsset(srcPath, patchKey, suffix) {
+                        if (!srcPath) {
+                            return Promise.resolve();
+                        }
+
+                        return new Promise(function (resolve, reject) {
+                            let ext = path.extname(srcPath).toLowerCase();
+                            let uploadDir = path.join(
+                                process.cwd(),
+                                "files",
+                                "upload"
+                            );
+                            let uploadName = (
+                                manifest.module.toSpinalCase() +
+                                "-" + suffix + ext
+                            );
+
+                            if (!fs[existssync](uploadDir)) {
+                                fs[mkdirsync](uploadDir, {recursive: true});
+                            }
+
+                            fs[copyfile](
+                                srcPath,
+                                path.join(uploadDir, uploadName),
+                                function (err) {
+                                    if (err) {
+                                        reject(err);
+                                        return;
+                                    }
+                                    patch[patchKey] = uploadName;
+                                    resolve();
+                                }
+                            );
+                        });
+                    }
+
+                    return Promise.all([
+                        copyAsset(
+                            findDashboardImage(),
+                            "dashboardImage",
+                            "dashboard"
+                        ),
+                        copyAsset(findIconImage(), "icon", "icon")
+                    ]).then(function () {
+                        if (
+                            !patch.title &&
+                            !patch.dashboardImage &&
+                            !patch.icon
+                        ) {
+                            return Promise.resolve();
+                        }
+
+                        return pClient.query(
+                            "SELECT data FROM \"$settings\" " +
+                            "WHERE name='brandingSettings';"
+                        ).then(function (resp) {
+                            let row = resp.rows[0] || {};
+                            let data = Object.assign(
+                                {},
+                                row.data || {},
+                                patch
+                            );
+
+                            return settingsService.saveSettings({
+                                client: pClient,
+                                data: {
+                                    data,
+                                    name: "brandingSettings"
+                                },
+                                isInternal: true,
+                                user: pUser
+                            });
+                        });
+                    });
+                }
+
+                // Given the path inside the package dir, not the cwd's
+                function execute(filepath) {
+                    let exp = require(path.resolve(filepath));
 
                     exp.execute({
                         user: pUser,
@@ -748,6 +1133,7 @@
                     let n = i;
 
                     feathers.disablePropagation(true);
+                    viewsDeferred = true;
                     fs.readFile(subfilepath, "utf8", function (err, data) {
                         if (err) {
                             console.error(err);
@@ -909,6 +1295,7 @@
                     function handleFeathers() {
                         return new Promise(function (resolve, reject) {
                             feathers.disablePropagation(false);
+                            viewsDeferred = false;
                             if (installedFeathers) {
                                 feathers.propagateViews(pClient).then(
                                     resolve
@@ -917,6 +1304,22 @@
                             }
 
                             resolve();
+                        });
+                    }
+
+                    // The batches that waited for the views above
+                    function runDeferred() {
+                        return new Promise(function (resolve) {
+                            function next() {
+                                if (!deferredBatches.length) {
+                                    resolve();
+                                    return;
+                                }
+
+                                runBatch(deferredBatches.shift(), next);
+                            }
+
+                            next();
                         });
                     }
 
@@ -935,15 +1338,54 @@
 
                     // If we've processed all the files, wrap this up
                     if (!file) {
-                        handleFeathers().then(function () {
-                            return new Promise(function (resolve) {
-                                pClient.query("COMMIT;").then(resolve);
-                            });
+                        /*
+                            Up to and including the COMMIT, a failure
+                            rolls back like any other: building the
+                            views can fail -- a dependency loop, a
+                            relation to nothing -- and that used to
+                            reject straight past rollback(), so no
+                            ROLLBACK was sent, the connection was never
+                            given back, and the process thought it was
+                            still installing. After the COMMIT the
+                            schema has changed, so a failure there is
+                            reported without the "nothing committed"
+                            mark, and whoever is holding the instance
+                            keeps holding it.
+                        */
+                        let committed = false;
+
+                        let commitFailed = false;
+
+                        saveBranding().then(handleFeathers).then(
+                            runDeferred
+                        ).then(function () {
+                            return pClient.query("COMMIT;").catch(
+                                function (commitErr) {
+                                    commitFailed = true;
+                                    return Promise.reject(commitErr);
+                                }
+                            );
+                        }).then(function (resp) {
+                            committed = true;
+                            return resp;
                         }).then(
                             api.buildClientApi.bind(null, pDatasource, pUser)
-                        ).then(
-                            api.buildRestApi.bind(null, pDatasource, pUser)
-                        ).then(complete).catch(reject);
+                        ).then(complete).catch(function (err) {
+                            if (!committed) {
+                                rollback(err, {commitFailed});
+                                return;
+                            }
+                            isInstalling = false;
+                            if (conn) {
+                                try {
+                                    conn.done();
+                                } catch (ignore) {
+                                    // Already given back
+                                }
+                                conn = undefined;
+                            }
+                            reject(err);
+                        });
 
                         return;
                     }
@@ -962,8 +1404,18 @@
                     npm = file.npm || manifest.npm;
 
                     fs.readFile(filepath, "utf8", function (err, data) {
+                        /*
+                            A manifest naming a file that is not there.
+                            This used to log and return, so the install
+                            never settled: the request waited for ever,
+                            and a deployment waiting like that left the
+                            instance held with nobody told why.
+                        */
                         if (err) {
-                            console.error(err);
+                            rollback(new Error(
+                                "The package names " + filename +
+                                ", which is not in it: " + err.message
+                            ));
                             return;
                         }
 
@@ -978,7 +1430,7 @@
                                 install(filename);
                                 break;
                             case "execute":
-                                execute(filename);
+                                execute(filepath);
                                 break;
                             case "module":
                                 // The record of the module, never its code
@@ -1009,6 +1461,9 @@
                             case "workbook":
                                 saveWorkbooks(JSON.parse(content));
                                 break;
+                            case "dashboard":
+                                saveDashboards(JSON.parse(content));
+                                break;
                             case "settings":
                                 defineSettings(JSON.parse(content), module);
                                 break;
@@ -1031,12 +1486,29 @@
                     }
 
                     fs.readFile(filename, "utf8", function (err, data) {
+                        /*
+                            The refusals here come before BEGIN, so
+                            nothing has been touched; they go through
+                            rollback() all the same, which is what
+                            gives the target connection back and marks
+                            the failure as one that changed nothing.
+                            (ROLLBACK with no transaction open is a
+                            warning, not an error.)
+                        */
                         if (err) {
-                            reject(err);
+                            rollback(err);
                             return;
                         }
 
-                        manifest = JSON.parse(data);
+                        try {
+                            manifest = JSON.parse(data);
+                        } catch (parseErr) {
+                            rollback(new Error(
+                                filename + " is not valid JSON: " +
+                                parseErr.message
+                            ));
+                            return;
+                        }
 
                         /*
                             A package says which kind of database it
@@ -1050,7 +1522,7 @@
                             (manifest.target || "instance") !== "both" &&
                             (manifest.target || "instance") !== pTarget
                         ) {
-                            reject(new Error(
+                            rollback(new Error(
                                 "Package " + (manifest.module || "") +
                                 " installs into a \"" +
                                 (manifest.target || "instance") +
@@ -1060,7 +1532,14 @@
                             return;
                         }
 
-                        pClient.query("BEGIN;").then(processFile);
+                        pClient.query("BEGIN;").then(function () {
+                            return pClient.query(
+                                "SELECT txid_current()::text AS t;"
+                            );
+                        }).then(function (resp) {
+                            startTxid = resp.rows[0].t;
+                            processFile();
+                        }).catch(rollback);
                     });
                 }
 
@@ -1212,6 +1691,16 @@
                         ),
                         vClient.query(
                             "DELETE FROM style WHERE module=$1",
+                            [name]
+                        ),
+                        /*
+                            The vendor's help links. A customer's own
+                            belongs to no module (ADR-003), so the
+                            bright line holds here too: removing a
+                            module never takes their help with it.
+                        */
+                        vClient.query(
+                            "DELETE FROM help_link WHERE module=$1",
                             [name]
                         ),
                         vClient.query(
